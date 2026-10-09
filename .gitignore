@@ -26,3 +26,10 @@ venv/
 .idea/
 .vscode/
 *.swp
+
+# 抓包文件 —— 可能含账号信息，绝不提交
+*.har
+*.har.gz
+ctbu.har
+portal-*
+抓包*
