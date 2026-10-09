@@ -252,8 +252,19 @@ def setup_console_encoding():
 def load_config(log, path=None):
     path = path or CONFIG_PATH
     if not os.path.exists(path):
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(DEFAULT_CONFIG, f, ensure_ascii=False, indent=2)
+        # 注意：目录也可能不存在（比如 --config 指到了错的地方），
+        # 这里必须兜住，否则会甩一个 FileNotFoundError 堆栈给用户。
+        try:
+            parent = os.path.dirname(os.path.abspath(path))
+            if parent and not os.path.isdir(parent):
+                os.makedirs(parent, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(DEFAULT_CONFIG, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            log("配置文件不存在，且无法自动创建：%s" % path, "ERR")
+            log("原因：%s" % e, "ERR")
+            log("请检查 --config 的路径是否正确。", "ERR")
+            return None
         log("已生成配置文件：%s" % path)
         log("请用记事本/文本编辑器填好 username(学号) 和 password(统一身份认证密码) 后再运行。", "WARN")
         return None
@@ -263,11 +274,15 @@ def load_config(log, path=None):
             raw = f.read()
         cfg = json.loads(raw)
     except Exception as e:
-        log("配置文件读取失败：%s" % e, "ERR")
+        log("配置文件读取失败：%s（%s）" % (path, e), "ERR")
+        return None
+
+    if not isinstance(cfg, dict):
+        log("配置文件格式不对：最外层应该是一个 JSON 对象 {}", "ERR")
         return None
 
     merged = dict(DEFAULT_CONFIG)
-    merged.update(cfg or {})
+    merged.update(cfg)
     return merged
 
 

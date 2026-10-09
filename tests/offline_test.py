@@ -459,7 +459,48 @@ def main():
               "实际 %d 行" % len(txt.splitlines()))
     scenario("场景 7：日志文件必须真的有内容", s7)
 
+    # --- 场景 8：配置有问题时必须友好报错，不能甩堆栈 ---
+    # 起因：--config 指到不存在的目录时，load_config 的 open() 抛
+    # FileNotFoundError 且没人接，用户看到的是一整页 Python 堆栈。
+    def s8():
+        d = os.path.join(HERE, "_cfgtest")
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError:
+            pass
+
+        cases = []
+
+        p1 = os.path.join(d, "broken.json")
+        open(p1, "w").write("{ this is not json")
+        cases.append(("内容不是合法 JSON", p1))
+
+        p2 = os.path.join(d, "array.json")
+        open(p2, "w").write("[1,2,3]")
+        cases.append(("最外层是数组不是对象", p2))
+
+        cases.append(("路径所在的目录不存在", os.path.join(d, "no", "such", "dir", "cfg.json")))
+
+        for label, path in cases:
+            p = subprocess.run([sys.executable, os.path.join(ROOT, "campus_login.py"),
+                                "--config", path, "--quiet"],
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               cwd=ROOT, timeout=60)
+            out = p.stdout.decode("utf-8", "replace")
+            check("%s → 退出码 3" % label, p.returncode == 3,
+                  "实际 %s\n%s" % (p.returncode, out[-400:]))
+            check("%s → 不甩 Traceback" % label, "Traceback" not in out,
+                  out[-400:])
+    scenario("场景 8：配置异常要友好报错", s8)
+
     srv.shutdown()
+
+    # 场景 8 用的临时配置目录
+    try:
+        import shutil
+        shutil.rmtree(os.path.join(HERE, "_cfgtest"), ignore_errors=True)
+    except Exception:
+        pass
 
     # 清理测试产生的文件。
     # 关键：只删【本次测试之前不存在】的文件 —— 否则会把用户在校园网里
