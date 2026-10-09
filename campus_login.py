@@ -410,6 +410,41 @@ def http_get(url, timeout=6, cookie_jar=None, allow_redirect=True, headers=None)
         return None, {}, b"", url
 
 
+def http_post_raw(url, body_str, timeout=6, cookie_jar=None, headers=None):
+    """直接发送已经拼好的 body，不再做任何编码。
+
+    为什么需要它：前端 AuthInterFace.js 是这样发的 ——
+        var content = "userId=" + userId + "&password=" + password + ...;
+        thePost.send(data);          // 裸字符串直接 send，不再编码
+    各字段在 login_bch.js 里已经做过 encodeURIComponent 两遍了。
+    如果这里再用 urlencode 包一层，服务端就会多解一层，认证必然失败。
+    """
+    handlers = [urllib.request.ProxyHandler({})]
+    if cookie_jar is not None:
+        handlers.append(urllib.request.HTTPCookieProcessor(cookie_jar))
+    opener = urllib.request.build_opener(*handlers)
+
+    hdrs = {
+        "User-Agent": USER_AGENT,
+        "Accept": "*/*",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    }
+    if headers:
+        hdrs.update(headers)
+    body = (body_str or "").encode("utf-8")
+    req = urllib.request.Request(url, data=body, headers=hdrs, method="POST")
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            return resp.getcode(), resp.read()
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, e.read()
+        except Exception:
+            return e.code, b""
+    except Exception:
+        return None, b""
+
+
 def http_post(url, data, timeout=6, cookie_jar=None, headers=None):
     handlers = [urllib.request.ProxyHandler({})]
     if cookie_jar is not None:
@@ -821,15 +856,41 @@ class Portal(object):
             return body
         return None
 
-    def login(self, username, password, query_string, validcode, password_encrypt):
-        """提交登录。
+    def get_services(self, query_string):
+        """调 getServices 拿权威的出口（service）列表。
 
-        字段编码严格照抄前端 login_bch.js：
-            userId   = encodeURIComponent(encodeURIComponent(username))
-            password = encodeURIComponent(encodeURIComponent(password))
-            service / validcode / passwordEncrypt 同理，都是双重编码
-            queryString 例外 —— 前端直接把 location.search 去掉 '?' 后原样传，不再编码
-        表单序列化本身还会再编码一层，等价于 jQuery 的 $.post。
+        前端实现（AuthInterFace.js）：
+            post(ePortalUrl + "getServices" + "&queryString=" + queryString, '', callback)
+        也就是 POST，body 为空，queryString 拼在 URL 上。
+        注意：这里是 URL 里的参数，不适用"双重编码"，原样拼即可。
+        """
+        url = (self.base + "/eportal/InterFace.do?method=getServices"
+               + "&queryString=" + (query_string or ""))
+        code, body = http_post_raw(url, "", timeout=self.timeout, cookie_jar=self.jar,
+                                   headers={"Referer": self.base + "/eportal/index.jsp"})
+        text = smart_decode(body)
+        try:
+            return json.loads(text), code, text
+        except Exception:
+            return None, code, text
+
+    def login(self, username, password, query_string, validcode, password_encrypt):
+        """提交登录 —— 严格照抄前端 AuthInterFace.js 的拼装方式。
+
+        login_bch.js 先把各字段双重 URL 编码：
+            userId/password/service/validcode/passwordEncrypt
+              = encodeURIComponent(encodeURIComponent(x))
+            queryString 例外，直接是 location.search.substring(1)，原样不编码
+
+        AuthInterFace.js 再用裸字符串拼成 body 直接 send，不再编码：
+            content = "userId=" + userId + "&password=" + password + ... ;
+            thePost.send(content);
+
+        所以这里必须用 http_post_raw，绝不能再套一层 urlencode，
+        否则服务端会多解一层，认证必然失败。
+
+        密码是否加密：本部署页面里 passwordEncrypt=false，
+        且 AuthInterFace.js 里的 RSA 分支整段被注释掉，因此按明文提交。
         """
         double = self.cfg.get("double_encode", True)
 
@@ -837,21 +898,20 @@ class Portal(object):
             v = "" if v is None else str(v)
             return js_encode(js_encode(v)) if double else v
 
-        data = {
-            "userId": enc(username),
-            "password": enc(password),
-            "service": enc(self.cfg.get("service", "")),
-            "queryString": query_string or "",
-            "operatorPwd": enc(""),
-            "operatorUserId": enc(""),
-            "validcode": enc(validcode or ""),
-            "passwordEncrypt": enc("true" if password_encrypt else "false"),
-        }
+        content = ("userId=" + enc(username)
+                   + "&password=" + enc(password)
+                   + "&service=" + enc(self.cfg.get("service", ""))
+                   + "&queryString=" + (query_string or "")
+                   + "&operatorPwd=" + enc("")
+                   + "&operatorUserId=" + enc("")
+                   + "&validcode=" + enc(validcode or "")
+                   + "&passwordEncrypt=" + enc("true" if password_encrypt else "false"))
+
         referer = self.base + "/eportal/index.jsp"
         if query_string:
             referer += "?" + query_string
-        code, body = http_post(self.login_url, data, timeout=self.timeout,
-                               cookie_jar=self.jar, headers={"Referer": referer})
+        code, body = http_post_raw(self.login_url, content, timeout=self.timeout,
+                                   cookie_jar=self.jar, headers={"Referer": referer})
         text = smart_decode(body)
         try:
             return json.loads(text), code, text
@@ -988,22 +1048,85 @@ def discover_services(page_text, assets):
     return kv_pairs, bare_names
 
 
+def services_from_api(data):
+    """把 getServices 的返回解析成 [(显示名, serviceName)]。
+
+    返回结构在不同版本里有差异，常见的两种：
+      A) {"result":"success","serviceJson":"[{...}]","defaultService":"..."}
+      B) {"result":"success","services":[{"serviceName":..,"serviceShowName":..}]}
+    """
+    pairs = []
+    if not isinstance(data, dict):
+        return pairs
+
+    def take_list(lst):
+        for it in lst or []:
+            if not isinstance(it, dict):
+                continue
+            val = it.get("serviceName") or it.get("value") or ""
+            label = it.get("serviceShowName") or it.get("name") or val
+            if val:
+                pairs.append((label, val))
+
+    for key in ("services", "serviceList", "list"):
+        if isinstance(data.get(key), list):
+            take_list(data[key])
+
+    sj = data.get("serviceJson")
+    if isinstance(sj, str) and sj.strip():
+        try:
+            take_list(json.loads(sj))
+        except Exception:
+            pass
+
+    # 去重但保序
+    seen, out = set(), []
+    for label, val in pairs:
+        if val in seen:
+            continue
+        seen.add(val)
+        out.append((label, val))
+    return out
+
+
 def resolve_service(portal, query_string, cfg, log):
     """决定登录时要带的 service 值。
 
     config 里 service 明确写了就用它；写 "auto" 或留空则现场发现。
     返回 (首选值或 None, 说明, 按优先级排序的全部候选)。
     候选列表要带出来，因为万一首选不对还能逐个重试。
+
+    发现顺序：
+      1) getServices 接口 —— 权威、最准
+      2) 登录页 + JS 正则爬 —— 兜底
     """
     want = cfg.get("service", "")
     if want and str(want).lower() != "auto":
         return want, "来自 config.json", [(want, want)]
 
+    kv_pairs, bare_names = [], []
+    api_note = ""
+
+    # ---- 1) 权威接口 ----
     try:
-        page_text, assets, _ = fetch_login_assets(portal, query_string)
-        kv_pairs, bare_names = discover_services(page_text, assets)
+        data, code, raw = portal.get_services(query_string)
+        if log:
+            log("getServices 返回（code=%s）：%s" % (code, (raw or "").strip()[:400]))
+        got = services_from_api(data) if data else []
+        if got:
+            kv_pairs = got
+            api_note = "来自 getServices 接口；"
     except Exception as e:
-        return None, "出口发现失败：%s" % e, []
+        api_note = "getServices 调用失败(%s)；" % e
+
+    # ---- 2) 兜底：爬页面和 JS ----
+    if not kv_pairs:
+        try:
+            page_text, assets, _ = fetch_login_assets(portal, query_string)
+            kv_pairs, bare_names = discover_services(page_text, assets)
+            api_note += "改用页面/JS 解析；"
+        except Exception as e:
+            return None, "出口发现失败：%s" % e, []
 
     keywords = [k for k in [cfg.get("service_keyword") or "移动", "移动", "学生移动", "学生"] if k]
 
@@ -1020,7 +1143,7 @@ def resolve_service(portal, query_string, cfg, log):
 
     cands = [(label, val) for _, _, label, val in scored]
     if not cands:
-        return None, "页面和 JS 里没找到任何出口候选", []
+        return None, api_note + "没找到任何出口候选", []
 
     if log:
         log("发现 %d 个出口候选（按关键字优先级排序）：" % len(cands))
@@ -1030,10 +1153,10 @@ def resolve_service(portal, query_string, cfg, log):
     rank, tier, label, val = scored[0]
     if rank > len(keywords):
         if len(cands) == 1:
-            return val, "唯一候选「%s」" % (label or val), cands
-        return None, ("有 %d 个候选但没一个命中关键字，"
+            return val, api_note + "唯一候选「%s」" % (label or val), cands
+        return None, (api_note + "有 %d 个候选但没一个命中关键字，"
                       "请在 config.json 里把 service 写死" % len(cands)), cands
-    return val, "关键字命中「%s」" % (label or val), cands
+    return val, api_note + "关键字命中「%s」" % (label or val), cands
 
 
 # ---------------------------------------------------------------------------

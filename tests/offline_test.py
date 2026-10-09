@@ -50,6 +50,7 @@ class State(object):
         self.captcha_rejects_left = 0
         self.last_querystring = None
         self.last_service = None
+        self.get_services_calls = 0
         self.expected_user = USER
         self.expected_pwd = PWD
 
@@ -184,11 +185,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
         parsed = urllib.parse.urlsplit(self.path)
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length).decode("utf-8", "replace")
+        STATE.last_raw_body = raw          # 原样留档，供断言检查 wire 格式
         form = {k: v[0] for k, v in urllib.parse.parse_qs(raw, keep_blank_values=True).items()}
         sid = self.sid() or "anon"
 
         if parsed.path == "/eportal/InterFace.do":
             method = (urllib.parse.parse_qs(parsed.query).get("method") or [""])[0]
+
+            if method == "getServices":
+                # 复刻 AuthInterFace.getServices：POST，body 为空，queryString 在 URL 上
+                STATE.get_services_calls += 1
+                sj = json.dumps([
+                    {"serviceName": "staff_only", "serviceShowName": "教职员工专用"},
+                    {"serviceName": "student_mobile", "serviceShowName": "学生移动出口"},
+                    {"serviceName": "student_unicom", "serviceShowName": "学生联通出口"},
+                    {"serviceName": "student_telecom", "serviceShowName": "学生电信出口"},
+                ], ensure_ascii=False)
+                self.json_resp({"result": "success", "isService": "true",
+                                "defaultService": "请选择服务", "serviceJson": sj}, sid=sid)
+                return
+
             if method != "login":
                 self.json_resp({"result": "fail", "message": "不支持的 method"}, sid=sid)
                 return
@@ -324,11 +340,26 @@ def main():
         check("验证码下载 1 次", STATE.captcha_served == 1, "实际 %d" % STATE.captcha_served)
         check("日志里出现识别出的验证码", "验证码识别为" in out)
         check("日志里出现登录成功", "登录成功" in out)
-        # 出口自动发现：门户要求带对「学生移动出口」，程序必须自己从 JS 里挖出来
+        # 出口自动发现：门户要求带对「学生移动出口」，程序必须自己挖出来
         check("自动选中「学生移动出口」", STATE.last_service == "student_mobile",
               "实际提交的 service=%r" % STATE.last_service)
         check("日志里报告了出口选择", "使用出口 service" in out)
         check("出口候选被打印出来", "学生移动出口" in out)
+        # 新路径：优先走 AuthInterFace.getServices 权威接口，而不是正则爬 JS
+        check("调用了 getServices 接口", STATE.get_services_calls >= 1,
+              "实际 %d 次" % STATE.get_services_calls)
+        check("日志显示用接口拿到出口", "getServices 接口" in out)
+        # 提交体格式：必须与前端 AuthInterFace.js 的裸拼接完全一致
+        rb = STATE.last_raw_body or ""
+        check("提交体字段顺序与前端一致",
+              rb.startswith("userId=") and "&password=" in rb and "&service=" in rb
+              and "&queryString=" in rb and "&operatorPwd=" in rb
+              and "&operatorUserId=" in rb and "&validcode=" in rb
+              and rb.rstrip().endswith("passwordEncrypt=false"),
+              "实际 body=%r" % rb[:220])
+        check("queryString 原样回传、未被二次编码",
+              "&queryString=wlanuserip=" in rb and "%3D" not in rb.split("&queryString=")[1][:40],
+              "实际 body=%r" % rb[:220])
     scenario("场景 1：全新登录成功（含出口自动发现）", s1)
 
     # --- 场景 2：已登录时不做多余动作 ---

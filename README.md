@@ -83,11 +83,13 @@ CTBU 门户登录页是「统一身份用户 / 其他用户」两个标签页 + 
 > 配到了**上一条**的 `name:'教职员工专用'`，"移动"关键字就选错了出口。
 > 现在改成取**紧邻 service 之前的最后一个 name**，并有自动化测试守着。
 
-### 从真实 JS 里挖出来的前端协议细节
+### 从真实 JS 里挖出来的前端协议细节（已全部确认）
 
-抓下来的 `login_bch.js` 里有几处**必须照抄才能登录成功**的细节：
+以下每一条都来自在校园网里抓下来的真实前端代码，**照抄才能登录成功**。
 
-**① 所有字段双重 URL 编码**
+**① 提交体是"裸字符串拼接"，字段做双重 URL 编码**
+
+`login_bch.js` 先把各字段编码两遍：
 
 ```js
 var userId   = encodeURIComponent(encodeURIComponent(username));
@@ -95,35 +97,57 @@ var password = encodeURIComponent(encodeURIComponent(password));
 encrypt      = encodeURIComponent(encodeURIComponent(encrypt));
 ```
 
-`queryString` 是唯一的例外 —— `getQueryString()` 直接返回
-`location.search.substring(1)`，**原样不编码**。这也是为什么必须从 AC 的
-302 跳转里原样抓取再原样回传：里面的 `wlanuserip` / `mac` / `nasip`
-都是 **AES 加密值**（32 位十六进制），自己造不出来。
-
-**② 密码可能要 RSA 加密**
+`AuthInterFace.js` 再**裸拼**成 body 直接 `send()`，**不再编码**：
 
 ```js
-var encrypt = document.getElementById("passwordEncrypt").value;  // 页面隐藏字段
-var macString = getQueryStringByName("mac");
-if("true" == encrypt){
-    var passwordMac = password + ">" + macString;   // 密码 + ">" + 加密后的 mac
-    password = encryptedPassword(passwordMac);      // RSA
+var content = "userId=" + userId + "&password=" + password + "&service=" + service
+            + "&queryString=" + queryString + "&operatorPwd=" + operatorPwd
+            + "&operatorUserId=" + operatorUserId + "&validcode=" + validcode
+            + "&passwordEncrypt=" + passwordEncrypt;
+post(ePortalUrl + "login", content, callback);
+```
+
+> ⚠️ 这里最容易踩坑：如果用 `urlencode()` 再包一层，服务端会多解一层，
+> **认证必然失败**。程序用 `http_post_raw()` 发送，并有用例逐字段校验 body 格式。
+
+`queryString` 是唯一例外 —— `getQueryString()` 返回 `location.search.substring(1)`，
+**原样不编码**。里面的 `wlanuserip` / `mac` / `nasip` 都是 **AES 加密值**
+（32 位十六进制），自己造不出来，只能从 AC 的 302 跳转里原样抓取再原样回传。
+
+**② 密码不加密（明文提交）**
+
+页面隐藏字段实测为：
+
+```html
+<input id="passwordEncrypt"  name="passwordEncrypt"  value="false" type="hidden">
+<input id="publicKeyExponent" name="publicKeyExponent" value=""    type="hidden">
+<input id="publicKeyModulus"  name="publicKeyModulus"  value=""    type="hidden">
+```
+
+密钥字段是空的，而且 `AuthInterFace.js` 里那段 RSA 分支**整段被 `/* */` 注释掉了**
+（注释里还写着"老的加密算法有问题"）。所以 `security.js`（RSAUtils）只是被引进来但没启用。
+
+**③ 出口（service）列表走 `getServices` 接口**
+
+```js
+getServices: function(queryString, callback){
+    post(ePortalUrl + "getServices" + "&queryString=" + queryString, '', callback);
 }
 ```
 
-页面同时引了 `security.js` —— 那是 RSAUtils（RSA 加密库），
-所以这个部署**很可能是 `passwordEncrypt=true` + RSA**。
-`encryptedPassword()` 本身在 `AuthInterFace.js` 里。
+即 `POST /eportal/InterFace.do?method=getServices&queryString=<原样 queryString>`，
+**body 为空**，返回里含 `serviceJson` 字段。程序优先用它拿权威出口列表，
+拿不到才退回正则爬页面/JS。
 
-**③ 有两条登录路径**
+**④ 有两条登录路径，程序走的是经典表单那条**
 
 | 路径 | 触发方式 | 说明 |
 |---|---|---|
-| 统一身份（SSO） | 点「学生移动出口」→ `redirectSSO('移动')` → `login_sso.jsp?...&serviceName=移动` | 走学校统一身份认证 |
-| 其他用户（经典表单） | 填学号/密码/验证码 → `InterFace.do?method=login` | 程序当前实现的是这条 |
+| 统一身份（SSO） | 点「学生移动出口」→ `redirectSSO('移动')` → `login_sso.jsp?...&serviceName=移动` | 302 到 `cas.ctbu.edu.cn` 的 OAuth2 统一身份认证 |
+| 其他用户（经典表单） | 学号 + 密码 + 验证码 → `InterFace.do?method=login` | **程序实现的是这条**（也是学校使用指南描述的那条） |
 
-`redirectSSO` 的出口名取值是：`default` / `移动` / `联通` / `电信` / `校园网`，
-并且做了**双重 URL 编码**再拼进 URL。
+`redirectSSO` 的出口名取值是 `default` / `移动` / `联通` / `电信` / `校园网`，
+并做双重 URL 编码后拼进 URL。
 
 ### 验证码是怎么识别的（重点）
 
