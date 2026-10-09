@@ -125,8 +125,9 @@ DEFAULT_CONFIG = {
     "detect_ssid": True,
     "campus_subnets": ["10.203.0.0/17"],
     "captcha_length": 4,
-    "max_captcha_attempts": 6,
+    "max_captcha_attempts": 8,
     "max_password_attempts": 2,
+    "max_sso_attempts": 8,
     "password_encrypt": False,
     "password_transform": "plain",
     "double_encode": True,
@@ -136,6 +137,7 @@ DEFAULT_CONFIG = {
     "cas_base": "https://cas.ctbu.edu.cn/lyuapServer",
     "captcha_mode": "auto",
     "http_timeout": 6,
+    "sso_timeout": 30,
     "captive_probe_urls": [
         "http://captive.apple.com/hotspot-detect.html",
         "http://connect.rom.miui.com/generate_204",
@@ -1274,18 +1276,28 @@ def vision_ocr(image_path, log=None):
     return digits or None
 
 
+#: 记录本次运行里各 OCR 后端是否可用 / 是否成功过
+_OCR_STATE = {}
+_DDDDOCR = [None]      # 缓存实例，避免每次都重新加载 ONNX 模型（约 1 秒）
+
+
 def ddddocr_ocr(image_bytes, log=None):
     """如果装了 ddddocr 就用它（对带干扰线的验证码准得多）。没装返回 None。"""
-    try:
-        import ddddocr  # noqa
-    except Exception:
+    if _DDDDOCR[0] is False:
         return None
+    if _DDDDOCR[0] is None:
+        try:
+            import ddddocr
+            _DDDDOCR[0] = ddddocr.DdddOcr(show_ad=False)
+        except Exception:
+            _DDDDOCR[0] = False
+            return None
     try:
-        ocr = ddddocr.DdddOcr(show_ad=False)
-        return re.sub(r"\D", "", ocr.classification(image_bytes)) or None
+        return re.sub(r"\D", "", _DDDDOCR[0].classification(image_bytes)) or None
     except Exception as e:
         if log:
             log("ddddocr 调用失败：%s" % e, "WARN")
+        _DDDDOCR[0] = False
         return None
 
 
@@ -1303,6 +1315,10 @@ def solve_captcha(img_bytes, cfg, log, want_len=4):
     """识别/录入验证码。返回字符串或 None。
 
     优先级：ddddocr -> Vision -> 人工输入（弹图 + 命令行输入）
+
+    auto 模式下的一个细节：如果 OCR 是可用的（哪怕这次认错了），也**不要**
+    弹图让人输 —— 认错就换一张再来，这才是"自动"的意义。只有 OCR 完全不可用
+    时才转人工。_OCR_STATE 记录本次运行里 OCR 到底能不能用。
     """
     mode = str(cfg.get("captcha_mode", "auto")).lower()
     path = os.path.join(HERE, "cas-captcha.jpg")
@@ -1313,18 +1329,27 @@ def solve_captcha(img_bytes, cfg, log, want_len=4):
         path = None
 
     if mode in ("auto", "ocr"):
-        code = ddddocr_ocr(img_bytes, log)
-        if code and len(code) == want_len:
-            if log:
-                log("验证码（ddddocr）识别为：%s" % code)
-            return code
-        if path:
-            code = vision_ocr(path, log)
+        for name, fn in (("ddddocr", lambda: ddddocr_ocr(img_bytes, log)),
+                         ("Vision", lambda: vision_ocr(path, log) if path else None)):
+            if _OCR_STATE.get(name) is False:
+                continue          # 本次运行已确认不可用，别浪费时间
+            code = fn()
             if code and len(code) == want_len:
+                _OCR_STATE[name] = True
+                _OCR_STATE["ever_worked"] = True
                 if log:
-                    log("验证码（Vision）识别为：%s" % code)
+                    log("验证码（%s）识别为：%s" % (name, code))
                 return code
+            if code is None:
+                _OCR_STATE[name] = False
+            else:
+                _OCR_STATE[name] = True      # 能用，只是这次长度不对
         if mode == "ocr":
+            return None
+        # OCR 可用但认错了 -> 本次不弹图，直接换一张；只有 OCR 完全不可用才问人
+        if _OCR_STATE.get("ever_worked"):
+            if log:
+                log("OCR 本次没给出可用结果，换一张重试。")
             return None
 
     # 人工兜底
@@ -1355,20 +1380,74 @@ class CASSSO(object):
         self.log = log
         self.jar = jar
         self.base = (cfg.get("cas_base") or "https://cas.ctbu.edu.cn/lyuapServer").rstrip("/")
-        self.timeout = int(cfg.get("http_timeout", 6)) + 4
+        # CAS 在校外网段，首次 DNS+TLS 握手明显比内网慢，超时给宽一点
+        self.timeout = max(int(cfg.get("sso_timeout", 30)), int(cfg.get("http_timeout", 6)) + 4)
 
     def _log(self, msg, level="INFO"):
         if self.log:
             self.log(msg, level)
 
+    def _warmup(self):
+        """先热身一次到 CAS 的连接，避免"第一次必失败"。
+
+        实测踩坑：在未认证的校园网里，第一次访问外部 HTTPS 主机
+        （DNS 解析 + TLS 握手）可能超过 10 秒，直接超时失败；
+        紧接着再试一次就正常了（code=200，6 万字节）。
+        所以先探一次把链路建起来，失败也不影响后面的正式流程。
+        """
+        for i in range(3):
+            code, h, b, f = http_get(self.base + "/login", timeout=self.timeout,
+                                     cookie_jar=self.jar)
+            if code:
+                self._log("CAS 连通性预热成功（第 %d 次，code=%s）" % (i + 1, code))
+                return True
+            self._log("CAS 预热第 %d 次未通，稍后重试..." % (i + 1), "WARN")
+            time.sleep(1.5)
+        return False
+
     def run(self, portal, username, password, query_string, service_name):
-        """返回 (是否成功, 说明)。"""
+        """带重试的 SSO 登录，返回 (是否成功, 说明)。
+
+        重试策略（对应"错误 8 次再停止"）：
+          * 验证码错误 / 网络抖动 / 停在登录页 → 换一张验证码重来
+          * 账号或密码错误 → 立即停止（重试没有意义，只会刷失败次数）
+          * RSA、模板等实现类错误 → 立即停止
+        """
+        attempts = max(1, int(self.cfg.get("max_sso_attempts", 8)))
+        self._warmup()
+        last = ""
+        for i in range(1, attempts + 1):
+            self._log("—— SSO 第 %d/%d 次尝试 ——" % (i, attempts))
+            try:
+                ok, why, fatal = self._attempt(portal, username, password,
+                                               query_string, service_name)
+            except Exception as e:
+                ok, why, fatal = False, "SSO 异常：%s" % e, False
+            if ok:
+                return True, why
+            last = why
+            if fatal:
+                return False, why
+            if i < attempts:
+                self._log("本次未成功：%s —— 换一张验证码重试" % why, "WARN")
+                time.sleep(0.8)
+        return False, "连续 %d 次都没成功，最后一次：%s" % (attempts, last)
+
+    def _attempt(self, portal, username, password, query_string, service_name):
+        """单次 SSO 尝试。返回 (是否成功, 说明, 是否致命)。"""
         # --- 1. 门户 SSO 入口，跟随跳转落到 CAS 登录页 ---
         svc = js_encode(js_encode(service_name or "default"))
         entry = "%s/eportal/login_sso.jsp?%s&serviceName=%s" % (portal.base, query_string, svc)
         self._log("SSO 入口：%s" % entry[:160])
-        code, headers, body, final = http_get(entry, timeout=self.timeout,
-                                              cookie_jar=self.jar, allow_redirect=True)
+
+        code = None
+        for attempt in range(2):   # 外网首连偶发超时，给一次内层重试
+            code, headers, body, final = http_get(entry, timeout=self.timeout,
+                                                  cookie_jar=self.jar, allow_redirect=True)
+            if code:
+                break
+            self._log("SSO 入口请求超时（第 %d 次），重试..." % (attempt + 1), "WARN")
+            time.sleep(1.5)
         html = smart_decode(body)
         self._log("SSO 跳转落地：code=%s 地址=%s 正文=%d 字节" % (code, final[:110], len(body)))
 
@@ -1384,14 +1463,14 @@ class CASSSO(object):
             m = re.search(r'name="execution"\s+value="([^"]+)"', html)
             execution = m.group(1) if m else ""
         if not execution:
-            return False, "拿不到 CAS 的 execution 令牌（落地页异常）"
+            return False, "拿不到 CAS 的 execution 令牌（code=%s，可能是外网还没通）" % code, False
 
         # --- 2. 验证码 ---
         cap_url = "%s/kaptcha?time=%d" % (self.base, int(time.time() * 1000))
         ccode, ch, cbody, cf = http_get(cap_url, timeout=self.timeout, cookie_jar=self.jar,
                                         headers={"Referer": self.base + "/login", "Accept": "image/*"})
         if ccode != 200 or not cbody:
-            return False, "验证码下载失败（code=%s）" % ccode
+            return False, "验证码下载失败（code=%s）" % ccode, False
 
         # --- 3. RSA 公钥 ---
         kcode, kh, kbody, kf = http_get(self.base + "/v2/getPubKey", timeout=self.timeout,
@@ -1403,19 +1482,19 @@ class CASSSO(object):
         except Exception:
             pass
         if not modulus or not exponent:
-            return False, "拿不到 RSA 公钥（code=%s）" % kcode
+            return False, "拿不到 RSA 公钥（code=%s）" % kcode, False
 
         # --- 4. 解验证码 ---
-        captcha = solve_captcha(cbody, self.cfg, self.log, want_len=int(self.cfg.get("captcha_length", 4)))
+        captcha = solve_captcha(cbody, self.cfg, self.log,
+                                want_len=int(self.cfg.get("captcha_length", 4)))
         if not captcha:
-            return False, "没有可用的验证码"
+            return False, "没有可用的验证码（识别失败或你取消了输入）", True
 
         # --- 5. 密码先反转再 RSA ---
-        rev = password[::-1]
         try:
-            enc_pwd = rsa_encrypt_shapiro(rev, modulus, exponent)
+            enc_pwd = rsa_encrypt_shapiro(password[::-1], modulus, exponent)
         except Exception as e:
-            return False, "RSA 加密失败：%s" % e
+            return False, "RSA 加密失败：%s" % e, True
         self._log("RSA 密文长度 %d（模数 %d bit）" % (len(enc_pwd), len(modulus) * 4))
 
         # --- 6. 提交 ---
@@ -1432,7 +1511,16 @@ class CASSSO(object):
                                              headers={"Referer": self.base + "/login",
                                                       "Origin": "https://" + urllib.parse.urlsplit(self.base).netloc})
         presp = smart_decode(pbody)
-        self._log("CAS 提交返回：code=%s 长度=%d 最终地址=%s" % (pcode, len(pbody), ptext[:110]))
+        self._log("CAS 提交返回：code=%s 长度=%d 最终地址=%s" % (pcode, len(pbody), ptext[:130]))
+
+        # 门户侧的 failTipMsg 也解出来，便于定位
+        try:
+            tip = urllib.parse.parse_qs(urllib.parse.urlsplit(ptext).query).get("failTipMsg", [""])[0]
+            tip = urllib.parse.unquote(urllib.parse.unquote(tip))
+            if tip:
+                self._log("门户提示：%s" % tip, "WARN")
+        except Exception:
+            pass
 
         # --- 7. 判定 ---
         errs = []
@@ -1444,18 +1532,22 @@ class CASSSO(object):
                     errs.append(t)
         blob = " ".join(errs)
         if "验证码" in blob:
-            return False, "CAS 说验证码错误（%s）" % blob
+            return False, "CAS 说验证码错误（%s）" % blob, False       # 换一张重试
         if "密码" in blob or "账号" in blob or "用户" in blob:
-            return False, "CAS 说账号或密码错误（%s）" % blob
+            return False, "CAS 说账号或密码错误（%s）" % blob, True    # 重试无意义
 
-        # 没报错，看看是否已经离开登录页 / 外网是否通了
+        # 外网探测可能比门户慢半拍，给几次机会
+        ok_net, why = False, ""
+        for k in range(3):
+            ok_net, why = check_internet(self.cfg, self.log)
+            if ok_net:
+                return True, "SSO 登录成功并已联网（%s）" % why, False
+            time.sleep(1.5)
+
         still_login = 'name="execution"' in presp
-        ok_net, why = check_internet(self.cfg, self.log)
-        if ok_net:
-            return True, "SSO 登录成功并已联网（%s）" % why
         if still_login:
-            return False, "CAS 仍然停在登录页，但没有明确错误信息"
-        return True, "SSO 流程已走完（外网探测：%s）" % why
+            return False, "CAS 仍停在登录页且无明确错误（外网探测：%s）" % why, False
+        return False, "SSO 流程已走完但外网仍不通（%s）" % why, False
 
 
 def http_post_form(url, data, timeout=10, cookie_jar=None, headers=None):
@@ -1522,28 +1614,51 @@ def campus_status(cfg, log):
     info["in_subnet"] = bool(info["local_ip"]) and any(
         ip_in_cidr(info["local_ip"], c) for c in cfg.get("campus_subnets", []))
 
+    # TCP 可达**不等于**门户真的在：开着代理/VPN（TUN 模式）时，任何地址都能
+    # 建立 TCP 连接，会误判成"在校园网"。实测踩过：本机 IP 变成 198.18.0.1
+    # 时 tcp_reachable 返回 True，但真实 HTTP 请求全部失败。
+    # 所以再做一次真实 HTTP 请求确认，并识别代理伪 IP 段。
+    fake_ip = bool(info["local_ip"]) and (
+        info["local_ip"].startswith("198.18.") or info["local_ip"].startswith("198.19."))
+    info["proxy_suspected"] = fake_ip
+    info["portal_http"] = False
+    if info["portal_tcp"]:
+        base0 = cfg["portal_candidates"][0].rstrip("/")
+        hc, hh, hb, hf = http_get(
+            base0 + "/eportal/InterFace.do?method=getOnlineUserInfo",
+            timeout=max(4, int(cfg.get("http_timeout", 6))))
+        htext = smart_decode(hb)
+        info["portal_http"] = bool(hc == 200 and ("result" in htext or "userIndex" in htext))
+        if not info["portal_http"]:
+            info["portal_tcp"] = False   # 退回不可达，避免假阳性
+
     ssid_ok = None
     if info["ssid"]:
         kws = [k.lower() for k in cfg.get("ssid_keywords", [])]
         ssid_ok = any(k in info["ssid"].lower() for k in kws) if kws else True
     info["ssid_match"] = ssid_ok
 
+    if fake_ip:
+        log("检测到本机 IP %s 属于代理/VPN 的伪地址段（198.18/198.19）—— "
+            "如果你开着 Clash/Surge 等 TUN 模式，请先关掉，否则登录一定失败。"
+            % info["local_ip"], "WARN")
     log("本机 IP：%s     默认网关：%s" % (info["local_ip"] or "未知", info["gateway"] or "未知"))
     if info["ssid"]:
         log("当前 WiFi：%s（来源：%s）" % (info["ssid"], info["ssid_source"]))
     else:
         log("当前 WiFi：识别不到（%s）" % info["ssid_source"], "WARN")
-    log("校园门户 %s:%d 可达：%s" % (portal_host, portal_port, "是" if info["portal_tcp"] else "否"))
+    log("校园门户 %s:%d 可达：%s" % (portal_host, portal_port,
+                                    "是" if info["portal_tcp"] else "否"))
     log("本机网段命中校园网段 %s：%s" % (cfg.get("campus_subnets"), "是" if info["in_subnet"] else "否"))
 
-    # 铁证优先：门户可达 = 一定在校园网
+    # 铁证优先：门户真实可访问 = 一定在校园网
     if info["portal_tcp"]:
         if ssid_ok is False:
             log("WiFi 名称 '%s' 不含关键字 %s，但你确实能连到校园门户，按校园网处理。"
                 % (info["ssid"], cfg.get("ssid_keywords")), "WARN")
         return True, info
 
-    if info["in_subnet"]:
+    if info["in_subnet"] and not fake_ip:
         log("在校园网段内但门户暂时不可达，仍按校园网处理（登录可能会失败）。", "WARN")
         return True, info
 
@@ -1667,6 +1782,19 @@ def do_login(cfg, log, check_only=False, train_mode=False):
     if not user or not pwd:
         log("config.json 里还没填 username / password。", "ERR")
         return 3
+
+    # --- 配成 sso 就直奔统一身份认证，不再去碰经典表单 ---
+    # CTBU 的学号属于统一身份体系，经典表单必然回「用户不存在或者密码错误」，
+    # 那一趟纯属浪费：既多一次失败计数，也白拉一张验证码。
+    if str(cfg.get("login_mode", "auto")).lower() == "sso":
+        log("按配置直接使用统一身份认证（SSO）通道。")
+        sso = CASSSO(cfg, log, portal.jar)
+        ok, why = sso.run(portal, user, pwd, query_string, cfg.get("service") or "default")
+        if ok:
+            log("登录成功：%s" % why, "OK")
+            return 0
+        log("SSO 登录失败：%s" % why, "ERR")
+        return 4
 
     # 密码变换策略
     base_transform = cfg.get("password_transform", "plain")
@@ -2221,7 +2349,41 @@ def do_selftest(log):
 # 入口
 # ---------------------------------------------------------------------------
 
+def maybe_reexec_in_venv():
+    """项目里若有 .venv（装了 ddddocr 等可选依赖），自动切过去运行。
+
+    这样"双击启动器"和"命令行 python3 campus_login.py"行为一致，
+    使用者不需要记住该用哪个解释器。
+    想禁用：设置环境变量 CTBU_NO_VENV=1
+    """
+    if os.environ.get("CTBU_NO_VENV") == "1":
+        return
+    if IS_WINDOWS:
+        venv_py = os.path.join(HERE, ".venv", "Scripts", "python.exe")
+    else:
+        venv_py = os.path.join(HERE, ".venv", "bin", "python3")
+    if not os.path.exists(venv_py):
+        return
+    # 注意：venv 里的 python3 是【指向系统 python 的符号链接】，
+    # 所以不能用 realpath(sys.executable) == realpath(venv_py) 判断是否已在 venv 里
+    # —— 那样永远相等，函数会直接 return，切换永远不生效（实测踩过）。
+    # 正确做法是看 sys.prefix。
+    venv_dir = os.path.join(HERE, ".venv")
+    try:
+        if os.path.realpath(sys.prefix) == os.path.realpath(venv_dir):
+            return
+        if os.path.realpath(sys.executable).startswith(os.path.realpath(venv_dir) + os.sep):
+            return
+    except Exception:
+        pass
+    try:
+        os.execv(venv_py, [venv_py, os.path.abspath(__file__)] + sys.argv[1:])
+    except Exception:
+        pass   # 切换失败就继续用当前解释器
+
+
 def main():
+    maybe_reexec_in_venv()
     setup_console_encoding()
 
     parser = argparse.ArgumentParser(
