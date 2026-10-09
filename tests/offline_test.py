@@ -464,6 +464,13 @@ def main():
     # FileNotFoundError 且没人接，用户看到的是一整页 Python 堆栈。
     def s8():
         d = os.path.join(HERE, "_cfgtest")
+        # 必须先清干净：load_config 对不存在的路径会自动创建默认配置，
+        # 不清掉的话第二次跑时文件已存在，行为就变了（测试必须幂等）。
+        try:
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+        except Exception:
+            pass
         try:
             os.makedirs(d, exist_ok=True)
         except OSError:
