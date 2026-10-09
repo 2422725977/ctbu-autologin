@@ -276,6 +276,18 @@ def run_login(cfg_path, extra_args=None, timeout=90):
 
 RESULTS = []
 
+#: 测试开始前就已存在的文件 —— 这些是用户在校园网里抓到的珍贵产物，绝不能删
+_ARTIFACTS = ("test-config.json", "diagnostic-report.txt", "portal-login.html",
+              "portal-login.txt", "portal-js-AuthInterFace.js",
+              "captcha-sample-1.png", "captcha-sample-2.png",
+              "captcha-sample-3.png", "login.log")
+PREEXISTING = set()
+for _d in (ROOT, HERE):
+    for _n in _ARTIFACTS:
+        _p = os.path.join(_d, _n)
+        if os.path.exists(_p):
+            PREEXISTING.add(_p)
+
 
 def check(name, cond, detail=""):
     RESULTS.append((name, bool(cond), detail))
@@ -404,14 +416,19 @@ def main():
 
     srv.shutdown()
 
-    # 清理测试产生的文件，保持交付目录干净
+    # 清理测试产生的文件。
+    # 关键：只删【本次测试之前不存在】的文件 —— 否则会把用户在校园网里
+    # 辛苦抓到的诊断产物（报告 / 登录页 / JS / 验证码样本）一起删掉。
     for name in ("test-config.json", "diagnostic-report.txt", "portal-login.html",
-                 "portal-login.txt",
-                 "portal-js-AuthInterFace.js", "captcha-sample-1.png",
-                 "captcha-sample-2.png", "captcha-sample-3.png", "login.log"):
+                 "portal-login.txt", "portal-js-AuthInterFace.js",
+                 "captcha-sample-1.png", "captcha-sample-2.png",
+                 "captcha-sample-3.png", "login.log"):
         for base_dir in (ROOT, HERE):
+            path = os.path.join(base_dir, name)
+            if path in PREEXISTING:
+                continue
             try:
-                os.remove(os.path.join(base_dir, name))
+                os.remove(path)
             except OSError:
                 pass
 

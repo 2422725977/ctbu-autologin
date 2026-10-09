@@ -95,6 +95,10 @@ BUILTIN_TEMPLATES = {
     '7': (13, '3ff87ff87ff0403080600060006000c000c000c00180018001800300030003000600060006000c00'),
     '8': (11, '1f071c60ee0ee0ee0ef1c7983e01e01f037863ce1ee0ee0ee0e60c71c1f0'),
     '9': (13, '0f8038c070606070e030e038e038e038f038703838781fb00070006000e001c0038007001c00f000'),
+    # 0 和 5 由真机验证码 (2059) 补齐；同批次样本里已知数字与上述模板逐像素一致，
+    # 证明渲染是确定性的、跨会话稳定（详见 README「验证状态」）。
+    '0': (13, '078018c03060307070306030e038e038e038e038e038e038e038e038603070707070306018c00f00'),
+    '5': (11, '0fe1fc1fc2002007807e0ff80fc03c01e00e00600600600400c418ff07c0'),
 }
 
 #: 离线自检样本：(正确答案, 验证码 PNG 的 base64)
@@ -103,6 +107,10 @@ SELFTEST_SAMPLES = [
     ('4134', 'iVBORw0KGgoAAAANSUhEUgAAAFAAAAAeCAIAAAA0IQ7mAAAAzUlEQVR42u3Y0Q2AIAwEUFZzUKdzEDXhx4jKQY9a4xH+BOxDA5S0/qwkgQUW+L/gZZ72SmmW2xwrPQwruBoZDii1uKF1gpJRe/cmPPryEW7u+CNGgcEvUJ2vEOA8OgVs6dUUhsCNWh8wMYxO8HHccWBc+3kwvo15gE+DcsH4PtwXRjgwflxxAj8cD4au0iXP46R1OaI/2BJGD7haieDLjpYwBB6QLdHBb2ZLbuAo6SEL/LD3xMqHuWBkNY4OxhcVy+WOK1i3lgILLPALZQObuman2D2CkAAAAABJRU5ErkJggg=='),
     ('4821', 'iVBORw0KGgoAAAANSUhEUgAAAFAAAAAeCAIAAAA0IQ7mAAAA6ElEQVR42u3YQQ6EIAwFUK82B/V0HmTGxIQN0H5+i5axhpVg4KG04PZ92bUlOMEJfi/42D9nURuUgreUG+MD8ATLI6trhfa1VpYQU2MFq/01q5qP9O7gs/M8uFfVfO3chKqfmCf46mMqGPEsCaZjxH3g0gG4zOjxhQDjgNo8Ojg8k4UAG5NHCHAveViyl2VHER3s+z1PBxMht9RO2jBOBBM5pheiwffmEsatYLUgW0hkFXjlrYfB4CrwOr3celriwFwkXxVMTEQgsBznRrUrgYcWNv0bIAQY3HgMxUL1kfyJl+AEJ/jvrh/TmlBv+5785AAAAABJRU5ErkJggg=='),
     ('7648', 'iVBORw0KGgoAAAANSUhEUgAAAFAAAAAeCAIAAAA0IQ7mAAAA6ElEQVR42u2YQRaAIAhEuVoH7XQdpHYtKmlmFPMlvXYU8oNG0PbJLkvgBE7gWYC3dfFvygPyJB5Me+BXWjA+ai3QSjm36PSySXj1+WjCVyGAhfITSs4HLpkaA/ek9V/sBCyoi0D7B2CBFgQOF63o9OIAd2ZqLYtOLy7m+PeSN+EQ4FI0fqGyBfIBsFDPjuTUAId0Wm2BL5lnJeC0CszWWbEQvaE6LZbZ2tJqwHjf+uicYv4DcI/GA/zHtC16uE6rPmJ5PBwUuHKIk8fDKNGizjeEJAxxAKBNBVp7MGjjkaeWCZzACfzBdQChkT3r1bfJSgAAAABJRU5ErkJggg=='),
+    # 真实门户抓到的样本（含 0 和 5），用来证明 10 个数字字形全覆盖
+    ('2059', 'iVBORw0KGgoAAAANSUhEUgAAAFAAAAAeCAIAAAA0IQ7mAAAA/ElEQVR42u2YSxKEMAhEudocdE7nQZztlJqku9NoWSHlKl8eGALEvliLAi7gAl4IePt+Dh+1RNi/tYoVQwG+lKZz2GF0KBm4+XmIYg6KFjfdZT+ioD5wv98GjPxXOHBLQZrehzs7gVsnsZYHgZFbne6lO8C4WKD7Ad3Y3cCCWKxnfh54RqyW86dcwJuAcVOzz5UfOMkOmpFfDCww41FXeGldwKAx/+fkPkvZvpSNn8yBx3wocg9wVnoI3sBJyfDJlBLDTjsM8SlgL62YDw+FswBTzjwxH6bCDzlzSKKl82E8DMQLAGxdQUbl0kMBWEiD8ApBFfEKuIALeI32AzeIR8uuxWf/AAAAAElFTkSuQmCC'),
+    ('4669', 'iVBORw0KGgoAAAANSUhEUgAAAFAAAAAeCAIAAAA0IQ7mAAAA8klEQVR42u2Y0Q2AIAxEu5qDOp2DqIk/RlTuylU0lvDHCbxaaIvNP2uWwAmcwP8FnsZh7awe/OpevB+l9mCNtOBiQnE5SjFbI211Ja1drgT4ErHAci+oengI8Dav+2800t67ejfgiBMuWdF8tCp7U+IOwOXd2HiiKPHbgcGAiYvByCwDPsyFbKtqIEoscatAYDxnoACqhtMA42BgPugQX/nFPmpowhIFRl0tqtgmTjxKi5727sCy1PLlwFQUDKmWVLWOPF2PBQZt4TOcjzawHnbcc6pSsdsDAB5yfWIW9YkXD+ohBkxC3aj5iJfACZzAH2wL1xg1R8gAUoIAAAAASUVORK5CYII='),
+    ('9169', 'iVBORw0KGgoAAAANSUhEUgAAAFAAAAAeCAIAAAA0IQ7mAAAA7klEQVR42u2YXQ6DIBCEuVoP2tP1IPa1iYLzt43RNb4pMJ/AzuDYHnaNBm7gBn4W8Of9+r3xJs5AERk08L739WCypnUTVoYIPBMBzgC1FpCPKC8iDjgoUXtTlsEBI2vMBMZpNRl5YO1p8KOAnVwIuFTGhYBTm7wEWCgYIDDiZI6MmC2l5v/QWhfM5cCzHk+dVn5KMeOGz0XLwzjhbFEwPPoyYocHsyZF6lA+eDiO8k/g8uNhKh6ZwFRcH6W0rC3VpTQXOLi7TutWkFYEzp74ZmDBiBawpaKVHy9mJdESdGx8xgRn7p94DdzADXzT6wuElU8zKI1+zwAAAABJRU5ErkJggg=='),
 ]
 
 DEFAULT_CONFIG = {
@@ -121,6 +129,7 @@ DEFAULT_CONFIG = {
     "max_password_attempts": 2,
     "password_encrypt": False,
     "password_transform": "plain",
+    "double_encode": True,
     "service": "auto",
     "service_keyword": "移动",
     "http_timeout": 6,
@@ -438,6 +447,16 @@ def smart_decode(raw):
         except Exception:
             continue
     return raw.decode("utf-8", "replace")
+
+
+def js_encode(s):
+    """近似 JavaScript 的 encodeURIComponent。
+
+    前端把 userId / password / service / validcode 都做了
+    encodeURIComponent(encodeURIComponent(x)) 双重编码，服务端会解码两层。
+    对纯数字学号来说是恒等变换，但密码里含 ! * ' ( ) 等字符时就有区别了。
+    """
+    return urllib.parse.quote(s if s is not None else "", safe="!~*'()")
 
 
 # ---------------------------------------------------------------------------
@@ -803,15 +822,30 @@ class Portal(object):
         return None
 
     def login(self, username, password, query_string, validcode, password_encrypt):
+        """提交登录。
+
+        字段编码严格照抄前端 login_bch.js：
+            userId   = encodeURIComponent(encodeURIComponent(username))
+            password = encodeURIComponent(encodeURIComponent(password))
+            service / validcode / passwordEncrypt 同理，都是双重编码
+            queryString 例外 —— 前端直接把 location.search 去掉 '?' 后原样传，不再编码
+        表单序列化本身还会再编码一层，等价于 jQuery 的 $.post。
+        """
+        double = self.cfg.get("double_encode", True)
+
+        def enc(v):
+            v = "" if v is None else str(v)
+            return js_encode(js_encode(v)) if double else v
+
         data = {
-            "userId": username,
-            "password": password,
-            "service": self.cfg.get("service", ""),
+            "userId": enc(username),
+            "password": enc(password),
+            "service": enc(self.cfg.get("service", "")),
             "queryString": query_string or "",
-            "operatorPwd": "",
-            "operatorUserId": "",
-            "validcode": validcode or "",
-            "passwordEncrypt": "true" if password_encrypt else "false",
+            "operatorPwd": enc(""),
+            "operatorUserId": enc(""),
+            "validcode": enc(validcode or ""),
+            "passwordEncrypt": enc("true" if password_encrypt else "false"),
         }
         referer = self.base + "/eportal/index.jsp"
         if query_string:
@@ -1442,6 +1476,29 @@ def do_probe(cfg, log, probe_login=False):
     js_refs = re.findall(r"""(?:src|href)\s*=\s*["']([^"']+\.js(?:\?[^"']*)?)["']""", text)
     add("页面引用的 JS：%s" % (js_refs or "无"))
 
+    # 隐藏字段：passwordEncrypt 决定密码是否需要加密后再提交，是关键开关
+    add("")
+    add("--- 登录页隐藏字段 ---")
+    hidden_count = 0
+    for m in re.finditer(r"<input[^>]*>", text, re.I):
+        tag = m.group(0)
+        if "hidden" in tag.lower() or "passwordEncrypt" in tag or "net_access_type" in tag:
+            add("  " + re.sub(r"\s+", " ", tag)[:300])
+            hidden_count += 1
+    if hidden_count == 0:
+        add("  （没找到隐藏 input，可能由 JS 动态生成）")
+    pe = None
+    for pat in (r"""id=["']passwordEncrypt["'][^>]*value=["']([^"']*)["']""",
+                r"""value=["']([^"']*)["'][^>]*id=["']passwordEncrypt["']""",
+                r"""name=["']passwordEncrypt["'][^>]*value=["']([^"']*)["']"""):
+        m = re.search(pat, text, re.I)
+        if m:
+            pe = m.group(1)
+            break
+    add("passwordEncrypt = %s   ← 决定密码是否加密提交" % (pe if pe is not None else "(页面上没找到)"))
+    mac_m = re.search(r"""[\?&]mac=([^&\s"'<>]+)""", qs or "")
+    add("queryString 里的 mac = %s   ← 加密时密码要拼上它" % (mac_m.group(1) if mac_m else "(没有)"))
+
     saved = []
     for ref in js_refs[:8]:
         if ref.startswith("http://") or ref.startswith("https://"):
@@ -1552,6 +1609,95 @@ def do_probe(cfg, log, probe_login=False):
         add("登录页纯文本已保存：portal-login.txt")
     except Exception:
         pass
+
+    # ---- RSA 公钥探测 ----
+    # security.js 是 RSAUtils（RSA 加密库），说明密码可能是 RSA 加密后提交的。
+    # 公钥通常由一个接口下发。这里把常见接口都探一遍，并从 JS 里搜长十六进制串。
+    add("")
+    add("=== 8. RSA 公钥探测 ===")
+    key_endpoints = [
+        "InterFace.do?method=getPublicKey",
+        "InterFace.do?method=getKeyPair",
+        "InterFace.do?method=getRSAKey",
+        "userV2.do?method=getPublicKey",
+        "userV2.do?method=getKeyPair",
+        "InterFace.do?method=pageInfo",
+    ]
+    for ep in key_endpoints:
+        url = base + "/eportal/" + ep
+        kc, kh, kb, kf = http_get(url, timeout=cfg.get("http_timeout", 6), cookie_jar=portal.jar)
+        ktext = smart_decode(kb)
+        add("  %-40s code=%s len=%d" % (ep, kc, len(kb)))
+        if ktext.strip():
+            add("      %s" % re.sub(r"\s+", " ", ktext)[:400])
+
+    # 从页面和 JS 里找公钥痕迹
+    add("")
+    add("--- JS 里的密钥痕迹 ---")
+    allblobs = [(text, "login.html")] + [
+        (smart_decode(open(os.path.join(HERE, n), "rb").read()), n) for n in saved]
+    for kw in ("RSAUtils", "setMaxDigits", "getKeyPair", "encryptedString",
+               "publicKey", "modulus", "exponent", "passwordEncrypt", "encrypt"):
+        hits = []
+        for blob, tag in allblobs:
+            if kw in blob:
+                hits.append(tag)
+        if hits:
+            add("  %-18s 出现在：%s" % (kw, ", ".join(hits)))
+
+    # 长十六进制串（很可能是 RSA 模数）
+    add("")
+    add("--- 页面/JS 里的长十六进制串（疑似 RSA 模数）---")
+    found_hex = set()
+    for blob, tag in allblobs:
+        for m in re.finditer(r"""['"]([0-9a-fA-F]{64,512})['"]""", blob):
+            found_hex.add((tag, m.group(1)[:80] + ("..." if len(m.group(1)) > 80 else ""),
+                           len(m.group(1))))
+    if found_hex:
+        for tag, preview, ln in sorted(found_hex)[:10]:
+            add("  [%s] 长度%d：%s" % (tag, ln, preview))
+    else:
+        add("  （没找到，公钥可能是运行时通过接口下发的，见上面的接口探测结果）")
+
+    # 在 JS 里找 RSA 调用点，直接看它怎么用
+    for blob, tag in allblobs:
+        if "RSAUtils" in blob and "encryptedString" in blob:
+            add("")
+            add("--- %s 中的 RSA 调用上下文 ---" % tag)
+            for m in list(re.finditer(r".{200}encryptedString.{260}", blob, re.S))[:3]:
+                add("  " + re.sub(r"\s+", " ", m.group(0))[:460])
+            for m in list(re.finditer(r".{160}getKeyPair.{220}", blob, re.S))[:3]:
+                add("  " + re.sub(r"\s+", " ", m.group(0))[:380])
+
+    # ---- SSO（统一身份认证）跳转探测 ----
+    # 出口按钮的真实行为是 redirectSSO(name) -> login_sso.jsp?...&serviceName=<双重编码>
+    add("")
+    add("=== 9. SSO 跳转探测（login_sso.jsp）===")
+    if not qs:
+        add("  没有 queryString，跳过。")
+    else:
+        for name in ("移动", "default"):
+            enc = urllib.parse.quote(urllib.parse.quote(name))
+            sso_url = base + "/eportal/login_sso.jsp?" + qs + "&serviceName=" + enc
+            sc, sh, sb, sf = http_get(sso_url, timeout=cfg.get("http_timeout", 6),
+                                      cookie_jar=portal.jar, allow_redirect=False)
+            loc = sh.get("Location") or sh.get("location") or ""
+            add("  serviceName=%s（编码 %s）" % (name, enc))
+            add("    code=%s  Location=%s" % (sc, loc[:400] or "(无)"))
+            stext = smart_decode(sb)
+            if stext.strip():
+                add("    正文(%d字节)：%s" % (len(sb), re.sub(r"\s+", " ", stext)[:400]))
+                for m in re.finditer(r"""(?:action|href|location)\s*[=:]\s*["']([^"']{1,200})["']""",
+                                     stext, re.I):
+                    add("      链接: %s" % m.group(1)[:200])
+            # 再跟一层，看看最终落到哪
+            if loc:
+                fc, fh, fb, ff = http_get(loc, timeout=cfg.get("http_timeout", 6),
+                                          cookie_jar=portal.jar)
+                add("    跟随一跳 -> code=%s 最终=%s" % (fc, ff[:300]))
+                ftxt = smart_decode(fb)
+                if ftxt.strip():
+                    add("      正文(%d字节)：%s" % (len(fb), re.sub(r"\s+", " ", ftxt)[:500]))
 
     if probe_login:
         add("")

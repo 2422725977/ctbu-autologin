@@ -83,6 +83,48 @@ CTBU 门户登录页是「统一身份用户 / 其他用户」两个标签页 + 
 > 配到了**上一条**的 `name:'教职员工专用'`，"移动"关键字就选错了出口。
 > 现在改成取**紧邻 service 之前的最后一个 name**，并有自动化测试守着。
 
+### 从真实 JS 里挖出来的前端协议细节
+
+抓下来的 `login_bch.js` 里有几处**必须照抄才能登录成功**的细节：
+
+**① 所有字段双重 URL 编码**
+
+```js
+var userId   = encodeURIComponent(encodeURIComponent(username));
+var password = encodeURIComponent(encodeURIComponent(password));
+encrypt      = encodeURIComponent(encodeURIComponent(encrypt));
+```
+
+`queryString` 是唯一的例外 —— `getQueryString()` 直接返回
+`location.search.substring(1)`，**原样不编码**。这也是为什么必须从 AC 的
+302 跳转里原样抓取再原样回传：里面的 `wlanuserip` / `mac` / `nasip`
+都是 **AES 加密值**（32 位十六进制），自己造不出来。
+
+**② 密码可能要 RSA 加密**
+
+```js
+var encrypt = document.getElementById("passwordEncrypt").value;  // 页面隐藏字段
+var macString = getQueryStringByName("mac");
+if("true" == encrypt){
+    var passwordMac = password + ">" + macString;   // 密码 + ">" + 加密后的 mac
+    password = encryptedPassword(passwordMac);      // RSA
+}
+```
+
+页面同时引了 `security.js` —— 那是 RSAUtils（RSA 加密库），
+所以这个部署**很可能是 `passwordEncrypt=true` + RSA**。
+`encryptedPassword()` 本身在 `AuthInterFace.js` 里。
+
+**③ 有两条登录路径**
+
+| 路径 | 触发方式 | 说明 |
+|---|---|---|
+| 统一身份（SSO） | 点「学生移动出口」→ `redirectSSO('移动')` → `login_sso.jsp?...&serviceName=移动` | 走学校统一身份认证 |
+| 其他用户（经典表单） | 填学号/密码/验证码 → `InterFace.do?method=login` | 程序当前实现的是这条 |
+
+`redirectSSO` 的出口名取值是：`default` / `移动` / `联通` / `电信` / `校园网`，
+并且做了**双重 URL 编码**再拼进 URL。
+
 ### 验证码是怎么识别的（重点）
 
 CTBU 门户（锐捷 ePortal）的验证码是 4 位数字，经实测有两个关键性质：
