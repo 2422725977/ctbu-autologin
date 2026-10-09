@@ -1,0 +1,28 @@
+# ============================================================
+#  账号密码 —— 绝对不要提交！
+#  程序首次运行会自动生成 config.json，格式见 config.example.json
+# ============================================================
+config.json
+
+# 程序运行时产生的文件
+learned_templates.json
+login.log
+diagnostic-report.txt
+portal-login.html
+portal-login.txt
+portal-js-*.js
+captcha-sample-*.png
+tests/test-config.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/
+*.swp

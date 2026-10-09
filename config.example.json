@@ -1,0 +1,30 @@
+{
+  "_说明": "把这个文件复制成 config.json 再填账号密码。config.json 已被 .gitignore 忽略，不会被提交。",
+  "username": "你的10位学号",
+  "password": "你的统一身份认证密码",
+  "portal_candidates": [
+    "http://211.83.192.55",
+    "http://211.83.192.55:8080",
+    "http://1.1.1.1"
+  ],
+  "ssid_keywords": [
+    "CTBU"
+  ],
+  "detect_ssid": true,
+  "campus_subnets": [
+    "10.203.0.0/17"
+  ],
+  "captcha_length": 4,
+  "max_captcha_attempts": 6,
+  "max_password_attempts": 2,
+  "password_encrypt": false,
+  "password_transform": "plain",
+  "service": "",
+  "http_timeout": 6,
+  "captive_probe_urls": [
+    "http://captive.apple.com/hotspot-detect.html",
+    "http://connect.rom.miui.com/generate_204",
+    "http://www.msftconnecttest.com/connecttest.txt"
+  ],
+  "verify_url": "http://captive.apple.com/hotspot-detect.html"
+}
