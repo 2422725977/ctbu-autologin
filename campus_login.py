@@ -200,6 +200,39 @@ class Log(object):
             self.fh = None
 
 
+class Timer(object):
+    """分阶段计时，用来回答"到底慢在哪"。
+
+    只有开着计时（--check 或 --probe）才输出，平时不刷屏。
+    """
+
+    def __init__(self, log, enabled=False):
+        self.log = log
+        self.enabled = bool(enabled and log is not None)
+        self.t0 = time.time()
+        self.last = self.t0
+        self.marks = []
+
+    def mark(self, label):
+        now = time.time()
+        seg = now - self.last
+        self.marks.append((label, seg))
+        self.last = now
+        if self.enabled:
+            self.log("   · %-26s %5.2fs" % (label, seg))
+        return seg
+
+    def summary(self):
+        if not self.marks:
+            return ""
+        top = sorted(self.marks, key=lambda kv: -kv[1])[:4]
+        return "总耗时 %.1fs；最慢：%s" % (
+            self.total(), "、".join("%s %.1fs" % (k, v) for k, v in top))
+
+    def total(self):
+        return time.time() - self.t0
+
+
 def setup_console_encoding():
     """Windows 控制台默认不是 UTF-8，中文会乱码/报错。"""
     for stream in ("stdout", "stderr"):
@@ -318,12 +351,20 @@ def default_gateway():
     return None
 
 
-def detect_ssid():
+def detect_ssid(deep=False):
     """尽力识别当前 WiFi 名称。拿不到就返回 None（新版 macOS 会脱敏）。
 
     返回: (ssid 或 None, 说明文字)
+
+    deep=False（默认）：只走最快的方法。
+      macOS 上 networksetup 是毫秒级的；拿不到就算了 —— 因为新版 macOS 会把
+      SSID 脱敏成 <redacted>，继续跑 system_profiler（数秒）和 sudo wdutil
+      纯属浪费启动时间，而且结果一样是拿不到。程序判断"在不在校园网"主要靠
+      门户能不能真的连上，WiFi 名字只是锦上添花。
+    deep=True：诊断模式用，三种方法都试，尽量拿到信息。
     """
     if IS_WINDOWS:
+        # Windows 上 netsh 又快又准，直接一步到位
         ok, out = run_cmd(["netsh", "wlan", "show", "interfaces"])
         if ok:
             for line in out.splitlines():
@@ -334,25 +375,28 @@ def detect_ssid():
         return None, "netsh 未取到（无线网卡未连接或服务未启动）"
 
     if IS_MACOS:
-        # 1) networksetup：先找 Wi-Fi 设备名
-        ok, out = run_cmd(["networksetup", "-listallhardwareports"])
+        # 1) networksetup：先找 Wi-Fi 设备名，再问当前网络（都是毫秒级）
         dev = None
+        ok, out = run_cmd(["networksetup", "-listallhardwareports"], timeout=4)
         if ok:
-            blocks = out.split("Hardware Port:")
-            for b in blocks:
+            for b in out.split("Hardware Port:"):
                 if "Wi-Fi" in b or "AirPort" in b:
                     m = re.search(r"Device:\s*(\S+)", b)
                     if m:
                         dev = m.group(1)
                         break
         if dev:
-            ok2, out2 = run_cmd(["networksetup", "-getairportnetwork", dev])
+            ok2, out2 = run_cmd(["networksetup", "-getairportnetwork", dev], timeout=4)
             if ok2:
                 m = re.search(r"Current Wi-Fi Network:\s*(.+)", out2)
                 if not m:
                     m = re.search(r"你当前的无线网络是\s*(.+)", out2)
                 if m:
                     return m.group(1).strip(), "networksetup(%s)" % dev
+
+        if not deep:
+            return None, "networksetup 取不到（新版 macOS 常见），已跳过慢速探测"
+
         # 2) system_profiler：新版 macOS 常把 SSID 脱敏成 <redacted>
         ok3, out3 = run_cmd(["system_profiler", "SPAirPortDataType"], timeout=20)
         if ok3:
@@ -827,19 +871,25 @@ class Portal(object):
                 self.log("已从跳转 Location 抓到 queryString（来自 %s）" % url)
                 return q
 
-            # 2) 跟随跳转，看最终落地 URL 的 query
+            # 2) 正文里可能直接带着（有的 AC 把门户页塞进 200 响应）
+            #    放在第二次请求之前检查 —— 少发一次请求，实测能省一秒左右
+            text = smart_decode(body)
+            m = re.search(r"(wlanuserip=[^\"'\s<>&]+(?:&[^\"'\s<>&]+)*)", text)
+            if m:
+                self.log("已从页面正文抓到 queryString（来自 %s）" % url)
+                return m.group(1)
+
+            # 3) 实在没有才跟随跳转，看最终落地 URL 的 query
             code2, headers2, body2, final2 = http_get(
                 url, timeout=self.timeout, cookie_jar=self.jar, allow_redirect=True)
             q2 = pick(urllib.parse.urlsplit(final2).query)
             if q2:
                 self.log("已从最终地址抓到 queryString（来自 %s）" % url)
                 return q2
-
-            # 3) 有的设备直接把门户内容/脚本塞在 200 正文里
-            text = smart_decode(body2 or body)
-            m = re.search(r"(wlanuserip=[^\"'\s<>&]+(?:&[^\"'\s<>&]+)*)", text)
+            text2 = smart_decode(body2)
+            m = re.search(r"(wlanuserip=[^\"'\s<>&]+(?:&[^\"'\s<>&]+)*)", text2)
             if m:
-                self.log("已从页面正文抓到 queryString（来自 %s）" % url)
+                self.log("已从最终页面正文抓到 queryString（来自 %s）" % url)
                 return m.group(1)
 
         # 4) 再试 pageInfo
@@ -1429,6 +1479,17 @@ class CASSSO(object):
             if fatal:
                 return False, why
             if i < attempts:
+                # 自愈：macOS 的"加入网络"认证弹窗（CNA）也会去访问门户，
+                # 可能把我们这条 queryString 用掉，导致入口拿不到 execution。
+                # 这时候重新抓一次 queryString 再继续。
+                if "execution 令牌" in why or "设备未注册" in why:
+                    try:
+                        fresh = portal.capture_querystring()
+                        if fresh and fresh != query_string:
+                            query_string = fresh
+                            self._log("重新抓到 queryString（旧的可能被系统认证弹窗占用了）", "WARN")
+                    except Exception:
+                        pass
                 self._log("本次未成功：%s —— 换一张验证码重试" % why, "WARN")
                 time.sleep(0.8)
         return False, "连续 %d 次都没成功，最后一次：%s" % (attempts, last)
@@ -1595,8 +1656,12 @@ def check_internet(cfg, log=None):
 # 校园网判定
 # ---------------------------------------------------------------------------
 
-def campus_status(cfg, log):
-    """返回 (是否在校园网, 说明字典)。"""
+def campus_status(cfg, log, deep=False):
+    """返回 (是否在校园网, 说明字典)。
+
+    deep=False（默认）：跳过所有慢速探测，只为尽快做出判定。
+    deep=True：诊断模式，SSID 等能挖多深挖多深。
+    """
     info = {}
     parts = urllib.parse.urlsplit(cfg["portal_candidates"][0])
     portal_host = parts.hostname or "211.83.192.55"
@@ -1607,7 +1672,7 @@ def campus_status(cfg, log):
     info["local_ip"] = local_ip_towards(portal_host)
     info["gateway"] = default_gateway()
     if cfg.get("detect_ssid", True):
-        info["ssid"], info["ssid_source"] = detect_ssid()
+        info["ssid"], info["ssid_source"] = detect_ssid(deep=deep)
     else:
         info["ssid"], info["ssid_source"] = None, "已按配置关闭"
     info["portal_tcp"] = tcp_reachable(portal_host, portal_port, timeout=4)
@@ -1673,8 +1738,15 @@ def campus_status(cfg, log):
 # 门户发现
 # ---------------------------------------------------------------------------
 
-def discover_portal(cfg, log):
-    """在候选地址里找出真正能用的 ePortal。"""
+def discover_portal(cfg, log, known_good=None):
+    """在候选地址里找出真正能用的 ePortal。
+
+    known_good：campus_status 已经用真实 HTTP 请求确认过可用的地址。
+    既然已经验证过，就别再重复 TCP + HTTP 探测一遍（每次省约 0.5~1 秒）。
+    """
+    if known_good:
+        log("沿用校园网判定阶段已验证的门户：%s" % known_good, "OK")
+        return known_good
     for base in cfg.get("portal_candidates", []):
         host = urllib.parse.urlsplit(base).hostname
         if not host:
@@ -1702,13 +1774,18 @@ def discover_portal(cfg, log):
 # ---------------------------------------------------------------------------
 
 def do_login(cfg, log, check_only=False, train_mode=False):
+    t = Timer(log, enabled=check_only)
     on_campus, info = campus_status(cfg, log)
+    t.mark("校园网判定")
     if not on_campus:
         log("当前不在校园网（连不到校园门户，网段也不匹配），不执行任何登录动作。", "WARN")
         log("如果你确实连着 CTBU-Student，请把 portal_candidates 里的地址换成浏览器跳转时显示的地址。")
         return 2
 
-    base = discover_portal(cfg, log)
+    base = discover_portal(cfg, log,
+                           known_good=(cfg["portal_candidates"][0]
+                                       if info.get("portal_http") else None))
+    t.mark("门户发现")
     if not base:
         log("找不到可用的门户地址。请检查 portal_candidates 配置。", "ERR")
         return 6
@@ -1717,6 +1794,7 @@ def do_login(cfg, log, check_only=False, train_mode=False):
 
     # --- 是否已经登录 ---
     online, acct, raw = portal.online_info()
+    t.mark("查询在线状态")
     if online:
         log("门户显示已在线，账号：%s" % (acct or "未知"), "OK")
         ok, why = check_internet(cfg, log)
@@ -1724,6 +1802,7 @@ def do_login(cfg, log, check_only=False, train_mode=False):
         return 0
 
     ok, why = check_internet(cfg, log)
+    t.mark("外网探测")
     if ok:
         log("虽然门户没说在线，但外网已经通了（%s），无需登录。" % why, "OK")
         return 0
@@ -1742,6 +1821,7 @@ def do_login(cfg, log, check_only=False, train_mode=False):
         log("如果持续抓不到，请运行 --probe 生成诊断报告。", "WARN")
     else:
         log("queryString = %s" % query_string)
+    t.mark("抓 queryString")
 
     # --- 决定服务出口（service）---
     # CTBU 门户要先选「学生移动出口」才能登录，这一步以前要手点，现在自动发现。
@@ -1755,6 +1835,7 @@ def do_login(cfg, log, check_only=False, train_mode=False):
         log("没能确定出口 service：%s" % service_why, "WARN")
         log("将先按空 service 尝试；若失败，请在 config.json 里把 service 写死。", "WARN")
     svc_idx = 0
+    t.mark("出口发现(getServices)")
 
     # --- 先访问一次登录页，建立与这条 queryString 绑定的会话 ---
     # 浏览器就是这个顺序：先落地 index.jsp?<qs>（门户据此登记设备/会话），
@@ -1771,6 +1852,8 @@ def do_login(cfg, log, check_only=False, train_mode=False):
                     "建议重连一次 WiFi 后立刻重跑。", "WARN")
         except Exception as e:
             log("预访问登录页失败（不致命，继续）：%s" % e, "WARN")
+
+    t.mark("预访问登录页")
 
     templates = load_templates(log)
     missing = [d for d in "0123456789" if d not in templates]
@@ -1790,6 +1873,8 @@ def do_login(cfg, log, check_only=False, train_mode=False):
         log("按配置直接使用统一身份认证（SSO）通道。")
         sso = CASSSO(cfg, log, portal.jar)
         ok, why = sso.run(portal, user, pwd, query_string, cfg.get("service") or "default")
+        t.mark("SSO 登录")
+        log("耗时：%s" % t.summary())
         if ok:
             log("登录成功：%s" % why, "OK")
             return 0

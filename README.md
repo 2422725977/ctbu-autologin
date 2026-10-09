@@ -278,6 +278,7 @@ CTBU 门户（锐捷 ePortal）的验证码是 4 位数字，经实测有两个�
 | `启动-Windows.bat` | Windows 双击登录 |
 | `安装验证码识别-macOS.command` | 装 ddddocr，实现验证码全自动（需外网） |
 | `安装验证码识别-Windows.bat` | 同上，Windows 版 |
+| `认证弹窗开关-macOS.command` | 关闭/恢复 macOS 自动弹出的认证窗口 |
 | `诊断-macOS.command` / `诊断-Windows.bat` | 出问题时生成诊断报告 |
 | `ocr_vision.swift` | Vision OCR 助手源码（首次运行自动编译） |
 | `.venv/` | 装了 ddddocr 的独立环境（可选，删掉即卸载） |
@@ -340,6 +341,22 @@ cd 到本目录 && python3 campus_login.py
 **Q：验证码每次都要我手动输？**
 跑一次 `安装验证码识别-macOS.command` 装 ddddocr 就全自动了
 （实测 7/7 全对）。不装也能用，只是会弹图让你输 4 位数字。
+
+**Q：macOS 老是自动弹出"加入 CTBU-Student"的认证窗口，脚本会出错？**
+那个窗口叫 CNA（Captive Network Assistant），它和脚本**抢同一个门户会话**——
+它可能把会话"占掉"，让脚本抓到的 `queryString` 失效，报「设备未注册」或
+拿不到 CAS 令牌。
+
+两个应对（都已做）：
+1. 双击 `认证弹窗开关-macOS.command` **把它关掉**（推荐，需要管理员密码）
+2. 脚本会自愈：检测到这种情况就**重新抓一次 queryString** 再继续
+
+**Q：为什么跑得比想象中慢？**
+现在正常情况约 **2~5 秒**。本次针对速度做了三处优化：
+SSID 检测不再跑慢速探测（新版 macOS 反正拿不到，能省约 6 秒）、
+复用已确认的门户不再重复探测、`queryString` 抓取少发一次请求。
+
+想看每一步耗时，跑 `python3 campus_login.py --check`，它会打出分阶段计时。
 
 **Q：占多少内存？**
 纯标准库单进程，跑完即退，**峰值约 15~25 MB**，比一个浏览器标签页还小。
