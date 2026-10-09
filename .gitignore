@@ -33,3 +33,8 @@ venv/
 ctbu.har
 portal-*
 抓包*
+
+# OCR 助手（编译产物，各机器自行编译）
+ocr_vision
+.swiftcache/
+cas-captcha.jpg

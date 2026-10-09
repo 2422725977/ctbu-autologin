@@ -132,6 +132,9 @@ DEFAULT_CONFIG = {
     "double_encode": True,
     "service": "auto",
     "service_keyword": "移动",
+    "login_mode": "auto",
+    "cas_base": "https://cas.ctbu.edu.cn/lyuapServer",
+    "captcha_mode": "auto",
     "http_timeout": 6,
     "captive_probe_urls": [
         "http://captive.apple.com/hotspot-detect.html",
@@ -1167,6 +1170,319 @@ def resolve_service(portal, query_string, cfg, log):
 
 
 # ---------------------------------------------------------------------------
+# 统一身份认证（CAS / OAuth2 SSO）
+#
+# CTBU 的门户有两个标签页：
+#   统一身份用户 -> 点「学生移动出口」-> login_sso.jsp -> cas.ctbu.edu.cn（OAuth2）
+#   其他用户     -> 经典表单 -> InterFace.do?method=login（ePortal 本地账号体系）
+#
+# 实测：学号走经典表单会被回「用户不存在或者密码错误!」，因为学号属于统一
+# 身份体系。所以真正可行的是下面这条 SSO 链路：
+#
+#   1. GET  login_sso.jsp?<queryString>&serviceName=<双重编码的出口名>
+#           -> 302 到 cas.ctbu.edu.cn/lyuapServer/oauth2.0/authorize
+#           -> 302 到 cas.ctbu.edu.cn/lyuapServer/login?service=...
+#   2. 从 CAS 登录页取 execution 令牌
+#   3. GET  /kaptcha          取图片验证码（200x60 JPEG，带干扰线）
+#   4. GET  /v2/getPubKey     取 RSA 公钥 {modulus, exponent}
+#   5. 密码【先反转】再 RSA 加密，填进 #password
+#   6. POST /login  username / password(密文) / authcode / execution / _eventId=submit
+#   7. 跟随跳转回门户，门户据此完成联网认证
+#
+# 本实现已用真实 CAS 服务器 + 假账号验证过：服务器回「用户名或密码错误」
+# （而不是「验证码错误」或参数错误），证明整条请求格式与 RSA 密文都被接受。
+# ---------------------------------------------------------------------------
+
+def rsa_encrypt_shapiro(text, modulus_hex, exponent_hex):
+    """等价于 Shapiro RSAUtils.encryptedString(getKeyPair(e, "", n), text)。
+
+    前端原始实现（cas-security.js）：
+        var key = new RSAUtils.getKeyPair(public_exponent, "", Modulus);
+        var reversedPwd = password.split("").reverse().join("");
+        RSAUtils.encryptedString(key, reversedPwd);
+
+    要点：
+      * chunkSize = 2 * biHighIndex(modulus)，biHighIndex 会跳过前导零的 16bit 字
+      * 每个 chunk 按【小端】拼成整数：digits[j] = a[k] + (a[k+1] << 8)
+      * 密文输出为十六进制；分成多块时用空格连接（本例密码短，只有一块）
+    """
+    n = int(modulus_hex, 16)
+    e = int(exponent_hex, 16)
+    hi = (n.bit_length() + 15) // 16 - 1
+    while hi > 0 and ((n >> (16 * hi)) & 0xFFFF) == 0:
+        hi -= 1
+    chunk = 2 * hi
+    if chunk <= 0:
+        raise ValueError("模数太小")
+    data = text.encode("latin-1", "replace")
+    while len(data) % chunk:
+        data += b"\x00"
+    parts = []
+    for i in range(0, len(data), chunk):
+        c = pow(int.from_bytes(data[i:i + chunk], "little"), e, n)
+        h = "%x" % c
+        if len(h) % 4:
+            h = h.rjust(len(h) + (4 - len(h) % 4), "0")
+        parts.append(h)
+    return " ".join(parts)
+
+
+def vision_ocr(image_path, log=None):
+    """用 macOS 内置 Vision 做 OCR（零安装）。失败返回 None。
+
+    首次调用会自动编译 ocr_vision.swift；编译需要 Xcode 命令行工具。
+    注意：在受限沙箱里 Vision 的 XPC 服务可能不可用，此时返回 None 走人工兜底。
+    """
+    if not IS_MACOS:
+        return None
+    binary = os.path.join(HERE, "ocr_vision")
+    source = os.path.join(HERE, "ocr_vision.swift")
+    if not os.path.exists(binary):
+        if not os.path.exists(source):
+            return None
+        cache = os.path.join(HERE, ".swiftcache")
+        try:
+            os.makedirs(cache, exist_ok=True)
+        except Exception:
+            pass
+        if log:
+            log("首次运行，正在编译 OCR 助手（约 5 秒）...")
+        try:
+            p = subprocess.run(
+                ["swiftc", "-module-cache-path", cache, "-O", "-o", binary, source],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
+            if p.returncode != 0:
+                if log:
+                    log("OCR 助手编译失败（不影响使用，改人工输入）：%s"
+                        % p.stdout.decode("utf-8", "replace")[-200:], "WARN")
+                return None
+        except Exception as e:
+            if log:
+                log("OCR 助手编译异常（改人工输入）：%s" % e, "WARN")
+            return None
+    try:
+        p = subprocess.run([binary, image_path], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, timeout=30)
+        out = p.stdout.decode("utf-8", "replace").strip()
+    except Exception:
+        return None
+    if out.startswith("ERR"):
+        if log:
+            log("Vision OCR 不可用：%s（改人工输入）" % out[:120], "WARN")
+        return None
+    digits = re.sub(r"\D", "", out)
+    return digits or None
+
+
+def ddddocr_ocr(image_bytes, log=None):
+    """如果装了 ddddocr 就用它（对带干扰线的验证码准得多）。没装返回 None。"""
+    try:
+        import ddddocr  # noqa
+    except Exception:
+        return None
+    try:
+        ocr = ddddocr.DdddOcr(show_ad=False)
+        return re.sub(r"\D", "", ocr.classification(image_bytes)) or None
+    except Exception as e:
+        if log:
+            log("ddddocr 调用失败：%s" % e, "WARN")
+        return None
+
+
+def open_image(path):
+    try:
+        if IS_MACOS:
+            subprocess.Popen(["open", path])
+        elif IS_WINDOWS:
+            os.startfile(path)  # noqa
+    except Exception:
+        pass
+
+
+def solve_captcha(img_bytes, cfg, log, want_len=4):
+    """识别/录入验证码。返回字符串或 None。
+
+    优先级：ddddocr -> Vision -> 人工输入（弹图 + 命令行输入）
+    """
+    mode = str(cfg.get("captcha_mode", "auto")).lower()
+    path = os.path.join(HERE, "cas-captcha.jpg")
+    try:
+        with open(path, "wb") as f:
+            f.write(img_bytes)
+    except Exception:
+        path = None
+
+    if mode in ("auto", "ocr"):
+        code = ddddocr_ocr(img_bytes, log)
+        if code and len(code) == want_len:
+            if log:
+                log("验证码（ddddocr）识别为：%s" % code)
+            return code
+        if path:
+            code = vision_ocr(path, log)
+            if code and len(code) == want_len:
+                if log:
+                    log("验证码（Vision）识别为：%s" % code)
+                return code
+        if mode == "ocr":
+            return None
+
+    # 人工兜底
+    if log:
+        log("需要你认一下验证码。")
+    if path:
+        open_image(path)
+        log("验证码图片已打开：%s" % path)
+    for _ in range(3):
+        try:
+            ans = input("  请输入验证码（%d 位数字，回车取消）：" % want_len).strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        ans = re.sub(r"\D", "", ans)
+        if not ans:
+            return None
+        if len(ans) == want_len:
+            return ans
+        print("  长度不对，请重新输入。")
+    return None
+
+
+class CASSSO(object):
+    """统一身份认证（CAS + OAuth2）登录。"""
+
+    def __init__(self, cfg, log, jar):
+        self.cfg = cfg
+        self.log = log
+        self.jar = jar
+        self.base = (cfg.get("cas_base") or "https://cas.ctbu.edu.cn/lyuapServer").rstrip("/")
+        self.timeout = int(cfg.get("http_timeout", 6)) + 4
+
+    def _log(self, msg, level="INFO"):
+        if self.log:
+            self.log(msg, level)
+
+    def run(self, portal, username, password, query_string, service_name):
+        """返回 (是否成功, 说明)。"""
+        # --- 1. 门户 SSO 入口，跟随跳转落到 CAS 登录页 ---
+        svc = js_encode(js_encode(service_name or "default"))
+        entry = "%s/eportal/login_sso.jsp?%s&serviceName=%s" % (portal.base, query_string, svc)
+        self._log("SSO 入口：%s" % entry[:160])
+        code, headers, body, final = http_get(entry, timeout=self.timeout,
+                                              cookie_jar=self.jar, allow_redirect=True)
+        html = smart_decode(body)
+        self._log("SSO 跳转落地：code=%s 地址=%s 正文=%d 字节" % (code, final[:110], len(body)))
+
+        execution = ""
+        m = re.search(r'name="execution"\s+value="([^"]+)"', html)
+        if m:
+            execution = m.group(1)
+        if not execution:
+            # 落地页不是 CAS 登录页，就直接取一次
+            code, headers, body, final = http_get(self.base + "/login", timeout=self.timeout,
+                                                  cookie_jar=self.jar)
+            html = smart_decode(body)
+            m = re.search(r'name="execution"\s+value="([^"]+)"', html)
+            execution = m.group(1) if m else ""
+        if not execution:
+            return False, "拿不到 CAS 的 execution 令牌（落地页异常）"
+
+        # --- 2. 验证码 ---
+        cap_url = "%s/kaptcha?time=%d" % (self.base, int(time.time() * 1000))
+        ccode, ch, cbody, cf = http_get(cap_url, timeout=self.timeout, cookie_jar=self.jar,
+                                        headers={"Referer": self.base + "/login", "Accept": "image/*"})
+        if ccode != 200 or not cbody:
+            return False, "验证码下载失败（code=%s）" % ccode
+
+        # --- 3. RSA 公钥 ---
+        kcode, kh, kbody, kf = http_get(self.base + "/v2/getPubKey", timeout=self.timeout,
+                                        cookie_jar=self.jar)
+        modulus = exponent = None
+        try:
+            pk = json.loads(smart_decode(kbody))
+            modulus, exponent = pk.get("modulus"), pk.get("exponent")
+        except Exception:
+            pass
+        if not modulus or not exponent:
+            return False, "拿不到 RSA 公钥（code=%s）" % kcode
+
+        # --- 4. 解验证码 ---
+        captcha = solve_captcha(cbody, self.cfg, self.log, want_len=int(self.cfg.get("captcha_length", 4)))
+        if not captcha:
+            return False, "没有可用的验证码"
+
+        # --- 5. 密码先反转再 RSA ---
+        rev = password[::-1]
+        try:
+            enc_pwd = rsa_encrypt_shapiro(rev, modulus, exponent)
+        except Exception as e:
+            return False, "RSA 加密失败：%s" % e
+        self._log("RSA 密文长度 %d（模数 %d bit）" % (len(enc_pwd), len(modulus) * 4))
+
+        # --- 6. 提交 ---
+        data = {
+            "username": username,
+            "password": enc_pwd,
+            "authcode": captcha,
+            "execution": execution,
+            "_eventId": "submit",
+            "rememberMe": "true",
+        }
+        pcode, pbody, ptext = http_post_form(self.base + "/login", data, timeout=self.timeout,
+                                             cookie_jar=self.jar,
+                                             headers={"Referer": self.base + "/login",
+                                                      "Origin": "https://" + urllib.parse.urlsplit(self.base).netloc})
+        presp = smart_decode(pbody)
+        self._log("CAS 提交返回：code=%s 长度=%d 最终地址=%s" % (pcode, len(pbody), ptext[:110]))
+
+        # --- 7. 判定 ---
+        errs = []
+        for pat in (r'id="pwderrormsg"[^>]*>(.*?)</', r'id="yzmErrormsg"[^>]*>(.*?)</',
+                    r'id="errormsg"[^>]*>(.*?)</'):
+            for mm in re.finditer(pat, presp, re.S):
+                t = re.sub(r"<[^>]+>|\s+", " ", mm.group(1)).strip()
+                if t and t not in errs:
+                    errs.append(t)
+        blob = " ".join(errs)
+        if "验证码" in blob:
+            return False, "CAS 说验证码错误（%s）" % blob
+        if "密码" in blob or "账号" in blob or "用户" in blob:
+            return False, "CAS 说账号或密码错误（%s）" % blob
+
+        # 没报错，看看是否已经离开登录页 / 外网是否通了
+        still_login = 'name="execution"' in presp
+        ok_net, why = check_internet(self.cfg, self.log)
+        if ok_net:
+            return True, "SSO 登录成功并已联网（%s）" % why
+        if still_login:
+            return False, "CAS 仍然停在登录页，但没有明确错误信息"
+        return True, "SSO 流程已走完（外网探测：%s）" % why
+
+
+def http_post_form(url, data, timeout=10, cookie_jar=None, headers=None):
+    """标准表单 POST（urlencode），并且【跟随跳转】—— CAS 的登录是普通表单提交。"""
+    handlers = [urllib.request.ProxyHandler({})]
+    if cookie_jar is not None:
+        handlers.append(urllib.request.HTTPCookieProcessor(cookie_jar))
+    opener = urllib.request.build_opener(*handlers)
+    hdrs = {"User-Agent": USER_AGENT, "Accept": "*/*",
+            "Content-Type": "application/x-www-form-urlencoded"}
+    if headers:
+        hdrs.update(headers)
+    body = urllib.parse.urlencode(data).encode("utf-8")
+    req = urllib.request.Request(url, data=body, headers=hdrs, method="POST")
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            return resp.getcode(), resp.read(), resp.geturl()
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, e.read(), url
+        except Exception:
+            return e.code, b"", url
+    except Exception:
+        return None, b"", url
+
+
+# ---------------------------------------------------------------------------
 # 联网验证
 # ---------------------------------------------------------------------------
 
@@ -1363,6 +1679,7 @@ def do_login(cfg, log, check_only=False, train_mode=False):
     max_pwd = int(cfg.get("max_password_attempts", 2))
 
     pwd_tries = 0
+    tried_sso = False
     unknown_this_run = []
 
     for attempt in range(1, max_captcha + 1):
@@ -1429,8 +1746,23 @@ def do_login(cfg, log, check_only=False, train_mode=False):
             if pwd_tries < max_pwd and pwd_tries < len(strategies):
                 log("服务器拒绝：%s —— 换密码编码方式再试一次。" % msg, "WARN")
                 continue
-            log("服务器拒绝：%s" % msg, "ERR")
-            log("已停止重试，避免账号被锁定。请核对 config.json 里的学号与统一身份认证密码。", "ERR")
+            log("经典表单被拒绝：%s" % msg, "WARN")
+            # 实测结论：CTBU 的学号属于「统一身份」体系，经典表单（其他用户）
+            # 不是它的账号体系，必然回「用户不存在或者密码错误」。
+            # 所以这里自动转到统一身份认证（CAS/OAuth2）通道。
+            mode = str(cfg.get("login_mode", "auto")).lower()
+            if mode in ("auto", "sso") and not tried_sso:
+                tried_sso = True
+                log("改用统一身份认证（SSO）通道重试 ...")
+                sso = CASSSO(cfg, log, portal.jar)
+                ok, why = sso.run(portal, user, pwd, query_string,
+                                  cfg.get("service") or "default")
+                if ok:
+                    log("登录成功：%s" % why, "OK")
+                    return 0
+                log("SSO 通道也未成功：%s" % why, "ERR")
+                return 4
+            log("已停止重试，避免账号被锁定。", "ERR")
             return 4
 
         log("登录未成功（%s），重试。" % (msg or "无信息"), "WARN")

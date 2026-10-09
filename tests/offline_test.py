@@ -280,6 +280,7 @@ def make_config(port, **over):
         "captive_probe_urls": ["http://127.0.0.1:%d/hotspot-detect.html" % port],
         "verify_url": "http://127.0.0.1:%d/hotspot-detect.html" % port,
         "password_encrypt": False,
+        "login_mode": "classic",   # 离线测试不连真实 CAS；SSO 由专门的场景覆盖
     }
     cfg.update(over)
     path = os.path.join(HERE, "test-config.json")
@@ -392,7 +393,8 @@ def main():
         check("退出码为 4（账号密码被拒）", code == 4, "实际 %s\n%s" % (code, out))
         check("只提交了 1 次密码（不暴力重试）", STATE.login_posts == 1,
               "实际 %d" % STATE.login_posts)
-        check("日志给出明确提示", "已停止重试" in out)
+        check("日志说明经典表单被拒", "经典表单被拒绝" in out)
+        check("经典模式下不会去连 CAS", "统一身份认证（SSO）通道" not in out)
         check("没有误判为成功", not STATE.logged_in)
     scenario("场景 3：密码错误应立即停止", s3)
 
