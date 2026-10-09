@@ -110,9 +110,24 @@ post(ePortalUrl + "login", content, callback);
 > ⚠️ 这里最容易踩坑：如果用 `urlencode()` 再包一层，服务端会多解一层，
 > **认证必然失败**。程序用 `http_post_raw()` 发送，并有用例逐字段校验 body 格式。
 
-`queryString` 是唯一例外 —— `getQueryString()` 返回 `location.search.substring(1)`，
-**原样不编码**。里面的 `wlanuserip` / `mac` / `nasip` 都是 **AES 加密值**
-（32 位十六进制），自己造不出来，只能从 AC 的 302 跳转里原样抓取再原样回传。
+**每一个字段（含 `queryString`）都要双重 URL 编码，一个都不能漏：**
+
+```js
+// login_bch.js:678  ← 就是漏了这行，实测报「设备未注册」
+var queryString = encodeURIComponent(encodeURIComponent(getQueryString()));
+```
+
+> ⚠️ **踩坑记录**：`redirectSSO()` 里用的是**原样**的 `getQueryString()`
+> （那是拼进跳转 URL 的场景），我据此误以为登录提交也不编码。
+> 结果 `queryString` 里的 `&` 把表单解析切碎，服务端只收到第一个
+> `wlanuserip`，于是回报「设备未注册,请在ePortal上添加认证设备」。
+> **同一份代码里两处上下文编码方式不同，不能想当然推广。**
+
+`queryString` 必须从 AC 的 302 跳转里**原样抓取**：里面的 `wlanuserip` /
+`mac` / `nasip` 都是 **AES 加密值**（32 位十六进制），自己造不出来。
+
+程序在登录前还会**先访问一次 `index.jsp?<qs>`**（浏览器就是这个顺序，
+门户据此登记设备会话），然后用 `http_post_raw()` 发送裸拼接的 body。
 
 **② 密码不加密（明文提交）**
 

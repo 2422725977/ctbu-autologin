@@ -889,6 +889,13 @@ class Portal(object):
         所以这里必须用 http_post_raw，绝不能再套一层 urlencode，
         否则服务端会多解一层，认证必然失败。
 
+        queryString 同样要双重编码 —— login_bch.js 第 678 行：
+            var queryString = encodeURIComponent(encodeURIComponent(getQueryString()));
+        注意别被 redirectSSO 误导：那里是拼进跳转 URL，用的是原样的
+        getQueryString()；而登录提交这条路是编码过的。二者上下文不同。
+        不编码的话，queryString 里的 '&' 会把表单解析切碎，服务端只会收到
+        第一个 wlanuserip，于是回「设备未注册,请在ePortal上添加认证设备」。
+
         密码是否加密：本部署页面里 passwordEncrypt=false，
         且 AuthInterFace.js 里的 RSA 分支整段被注释掉，因此按明文提交。
         """
@@ -901,7 +908,7 @@ class Portal(object):
         content = ("userId=" + enc(username)
                    + "&password=" + enc(password)
                    + "&service=" + enc(self.cfg.get("service", ""))
-                   + "&queryString=" + (query_string or "")
+                   + "&queryString=" + enc(query_string or "")
                    + "&operatorPwd=" + enc("")
                    + "&operatorUserId=" + enc("")
                    + "&validcode=" + enc(validcode or "")
@@ -1317,6 +1324,22 @@ def do_login(cfg, log, check_only=False, train_mode=False):
         log("没能确定出口 service：%s" % service_why, "WARN")
         log("将先按空 service 尝试；若失败，请在 config.json 里把 service 写死。", "WARN")
     svc_idx = 0
+
+    # --- 先访问一次登录页，建立与这条 queryString 绑定的会话 ---
+    # 浏览器就是这个顺序：先落地 index.jsp?<qs>（门户据此登记设备/会话），
+    # 再拉验证码、再提交登录。少了这一步，服务端可能认不出设备。
+    if query_string:
+        try:
+            page_url = portal.base + "/eportal/index.jsp?" + query_string
+            pc, ph, pb, pf = http_get(page_url, timeout=cfg.get("http_timeout", 6),
+                                      cookie_jar=portal.jar)
+            body_text = smart_decode(pb)
+            log("已预访问登录页：code=%s，%d 字节，落地=%s" % (pc, len(pb), pf[:120]))
+            if "设备未注册" in body_text:
+                log("登录页直接回了「设备未注册」—— queryString 可能已失效，"
+                    "建议重连一次 WiFi 后立刻重跑。", "WARN")
+        except Exception as e:
+            log("预访问登录页失败（不致命，继续）：%s" % e, "WARN")
 
     templates = load_templates(log)
     missing = [d for d in "0123456789" if d not in templates]

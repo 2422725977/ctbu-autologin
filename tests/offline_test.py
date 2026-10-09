@@ -211,6 +211,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
             STATE.login_posts += 1
             qs = (form.get("queryString") or "").strip()
+            # 前端是双重编码，服务端解一层后应还原成单层编码的原始 queryString
+            try:
+                qs_decoded = urllib.parse.unquote(qs) if "%" in qs else qs
+            except Exception:
+                qs_decoded = qs
+            STATE.last_querystring_decoded = qs_decoded
             STATE.last_querystring = qs
             STATE.last_service = form.get("service") or ""
 
@@ -357,9 +363,15 @@ def main():
               and "&operatorUserId=" in rb and "&validcode=" in rb
               and rb.rstrip().endswith("passwordEncrypt=false"),
               "实际 body=%r" % rb[:220])
-        check("queryString 原样回传、未被二次编码",
-              "&queryString=wlanuserip=" in rb and "%3D" not in rb.split("&queryString=")[1][:40],
-              "实际 body=%r" % rb[:220])
+        # queryString 必须双重编码（login_bch.js:678）。
+        # 不编码的话里面的 & 会把表单解析切碎，服务端只会收到第一个 wlanuserip，
+        # 然后回「设备未注册,请在ePortal上添加认证设备」—— 这是实测踩过的坑。
+        seg = rb.split("&queryString=")[1].split("&operatorPwd=")[0] if "&queryString=" in rb else ""
+        check("queryString 已双重编码（%25 出现）", "%25" in seg,
+              "实际 queryString 段=%r" % seg[:150])
+        check("queryString 里的 & 不会切碎表单",
+              "&wlanacname" not in rb and "&mac=" not in rb.split("&queryString=")[1].split("&operatorPwd=")[0],
+              "实际 body=%r" % rb[:260])
     scenario("场景 1：全新登录成功（含出口自动发现）", s1)
 
     # --- 场景 2：已登录时不做多余动作 ---
