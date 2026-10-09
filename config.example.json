@@ -19,7 +19,8 @@
   "max_password_attempts": 2,
   "password_encrypt": false,
   "password_transform": "plain",
-  "service": "",
+  "service": "auto",
+  "service_keyword": "移动",
   "http_timeout": 6,
   "captive_probe_urls": [
     "http://captive.apple.com/hotspot-detect.html",

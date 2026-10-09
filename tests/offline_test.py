@@ -49,6 +49,7 @@ class State(object):
         self.login_posts = 0
         self.captcha_rejects_left = 0
         self.last_querystring = None
+        self.last_service = None
         self.expected_user = USER
         self.expected_pwd = PWD
 
@@ -133,15 +134,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         if path == "/eportal/interface/index_files/js/AuthInterFace.js":
-            # 模拟真实门户的登录脚本，供 --probe 抓取
-            js = (b"// mock AuthInterFace.js\n"
-                  b"function loginSubmit(){\n"
-                  b"  var passwordEncrypt = false;\n"
-                  b"  $.post('/eportal/InterFace.do?method=login', {\n"
-                  b"    userId:userId, password:password, service:service,\n"
-                  b"    queryString:queryString, operatorPwd:'', operatorUserId:'',\n"
-                  b"    validcode:validcode, passwordEncrypt:passwordEncrypt});\n"
-                  b"}\n")
+            # 模拟真实门户的登录脚本：出口列表就写在前端 JS 里（真实门户也是这样）
+            js = ("// mock AuthInterFace.js\n"
+                  "var serviceList = [\n"
+                  "  {name:'教职员工专用', service:'staff_only'},\n"
+                  "  {name:'学生移动出口', service:'student_mobile'},\n"
+                  "  {name:'学生联通出口', service:'student_unicom'},\n"
+                  "  {name:'学生电信出口', service:'student_telecom'}\n"
+                  "];\n"
+                  "function selectService(name, service){ window.service = service; }\n"
+                  "function loginSubmit(){\n"
+                  "  var passwordEncrypt = false;\n"
+                  "  $.post('/eportal/InterFace.do?method=login', {\n"
+                  "    userId:userId, password:password, service:service,\n"
+                  "    queryString:queryString, operatorPwd:'', operatorUserId:'',\n"
+                  "    validcode:validcode, passwordEncrypt:passwordEncrypt});\n"
+                  "}\n").encode("utf-8")
             self.send(200, js, "application/javascript;charset=UTF-8", sid=sid)
             return
 
@@ -188,11 +196,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             STATE.login_posts += 1
             qs = (form.get("queryString") or "").strip()
             STATE.last_querystring = qs
+            STATE.last_service = form.get("service") or ""
 
             # 复刻真实行为：queryString 为空 -> 用户名不能为空
             if not qs:
                 self.json_resp({"userIndex": None, "result": "fail",
                                 "message": "用户名不能为空"}, sid=sid)
+                return
+
+            # 复刻 CTBU 门户：必须先选对「学生移动出口」才能登录
+            if (form.get("service") or "") != "student_mobile":
+                self.json_resp({"userIndex": None, "result": "fail",
+                                "message": "请先选择服务出口"}, sid=sid)
                 return
 
             if STATE.captcha_rejects_left > 0:
@@ -297,7 +312,12 @@ def main():
         check("验证码下载 1 次", STATE.captcha_served == 1, "实际 %d" % STATE.captcha_served)
         check("日志里出现识别出的验证码", "验证码识别为" in out)
         check("日志里出现登录成功", "登录成功" in out)
-    scenario("场景 1：全新登录成功", s1)
+        # 出口自动发现：门户要求带对「学生移动出口」，程序必须自己从 JS 里挖出来
+        check("自动选中「学生移动出口」", STATE.last_service == "student_mobile",
+              "实际提交的 service=%r" % STATE.last_service)
+        check("日志里报告了出口选择", "使用出口 service" in out)
+        check("出口候选被打印出来", "学生移动出口" in out)
+    scenario("场景 1：全新登录成功（含出口自动发现）", s1)
 
     # --- 场景 2：已登录时不做多余动作 ---
     def s2():

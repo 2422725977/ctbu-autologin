@@ -121,7 +121,8 @@ DEFAULT_CONFIG = {
     "max_password_attempts": 2,
     "password_encrypt": False,
     "password_transform": "plain",
-    "service": "",
+    "service": "auto",
+    "service_keyword": "移动",
     "http_timeout": 6,
     "captive_probe_urls": [
         "http://captive.apple.com/hotspot-detect.html",
@@ -835,7 +836,170 @@ def classify_failure(message):
         return "username"
     if any(k in m for k in ("已在线", "已经在线", "重复登录", "已登录")):
         return "already"
+    # 顺序很重要：必须排在"密码/用户名"之后，否则会把账号密码错误误判成出口问题
+    if any(k in m for k in ("出口", "服务", "service", "运营商", "接入方式")):
+        return "service"
     return "other"
+
+
+# ---------------------------------------------------------------------------
+# 服务出口（service）自动发现
+#
+# CTBU 门户首页是「统一身份用户 / 其他用户」两个标签页 + 一排出口按钮：
+#   教职员工专用 / 学生移动出口 / 学生联通出口 / 学生电信出口 ...
+# 登录表单必须带上被选中出口对应的 service 值，否则认证不通过。
+# 这些出口名和值都写在前端 JS 里，所以运行时现场抓下来解析，不写死。
+# ---------------------------------------------------------------------------
+
+JS_REF_RE = re.compile(r"""(?:src|href)\s*=\s*["']([^"']+\.js(?:\?[^"']*)?)["']""")
+SERVICE_KV_RE = re.compile(r"""service\w*\s*[=:]\s*['"]([^'"]{1,80})['"]""", re.I)
+SERVICE_CALL_RE = re.compile(
+    r"""\w*[Ss]ervice\w*\s*\(\s*['"]([^'"]{1,80})['"]\s*,\s*['"]([^'"]{1,80})['"]""")
+CN_EXIT_RE = re.compile(r"""['"]([\u4e00-\u9fa5A-Za-z0-9]{2,16}出口)['"]""")
+
+
+def fetch_login_assets(portal, query_string):
+    """抓登录页和它引用的 JS。返回 (页面文本, {地址: 内容}, 登录页地址)。"""
+    page_url = portal.base + "/eportal/index.jsp"
+    if query_string:
+        page_url += "?" + query_string
+    code, headers, body, final = http_get(page_url, timeout=portal.timeout,
+                                          cookie_jar=portal.jar)
+    text = smart_decode(body)
+    assets = {}
+    for ref in JS_REF_RE.findall(text)[:8]:
+        if ref.startswith("http://") or ref.startswith("https://"):
+            url = ref
+        elif ref.startswith("/"):
+            url = portal.base + ref
+        else:
+            url = portal.base + "/eportal/" + ref
+        c, h, b, f = http_get(url, timeout=portal.timeout, cookie_jar=portal.jar)
+        if c == 200 and b:
+            assets[url] = smart_decode(b)
+    return text, assets, page_url
+
+
+NAME_KV_RE = re.compile(
+    r"""(?:name|title|label|text|serviceName|showName)\s*[:=]\s*['"]([^'"]{1,40})['"]""", re.I)
+
+
+def _label_near(blob, m):
+    """给一个 service 匹配找它对应的标签。
+
+    要点：取**紧邻 service 之前的最后一个 name**。
+    如果用一个宽对称窗口取第一个 name，会把上一条记录的 name 配到这一条上
+    （{name:'教职员工专用',service:'staff'}, {name:'学生移动出口',service:'mobile'}
+     里 mobile 会被错配成"教职员工专用"），关键字就会选错出口。
+    """
+    pre = blob[max(0, m.start() - 160): m.start()]
+    names = NAME_KV_RE.findall(pre)
+    if names:
+        return names[-1]
+    post = blob[m.end(): m.end() + 160]
+    nm = NAME_KV_RE.search(post)
+    if nm:
+        return nm.group(1)
+    # 退一步：找中文出口名，先看 service 之后（同一条记录内），再看之前（取最近的）
+    names = CN_EXIT_RE.findall(post)
+    if names:
+        return names[0]
+    names = CN_EXIT_RE.findall(pre)
+    if names:
+        return names[-1]
+    return ""
+
+
+def discover_services(page_text, assets):
+    """从页面和 JS 里挖出 (标签, service 值) 候选。
+
+    真实门户的出口列表长这样（对象数组）：
+        {name:'学生移动出口', service:'student_mobile'}
+    所以关键是**把 service 值和它附近的标签配起来**，而不是把中文名本身当成值 ——
+    否则「移动」关键字会先命中中文标签，选出一个根本不存在的 service。
+    """
+    kv_pairs = []      # (标签, 值) —— 有明确 service 值的
+    bare_names = []    # 只有中文出口名、没有配到值的兜底候选
+
+    for blob in [page_text] + list(assets.values()):
+        for m in SERVICE_KV_RE.finditer(blob):
+            kv_pairs.append((_label_near(blob, m), m.group(1)))
+
+        # 交互函数写法：selectService('student_mobile', '学生移动出口')
+        for m in SERVICE_CALL_RE.finditer(blob):
+            a, b = m.group(1), m.group(2)
+            if "出口" in a or CN_EXIT_RE.fullmatch("'" + a + "'"):
+                kv_pairs.append((a, b))
+            else:
+                kv_pairs.append((b, a))
+
+        for m in CN_EXIT_RE.finditer(blob):
+            bare_names.append((m.group(1), m.group(1)))
+
+    def dedup(seq):
+        seen, out = set(), []
+        for label, val in seq:
+            label, val = (label or "").strip(), (val or "").strip()
+            if not val or len(val) > 80:
+                continue
+            key = (label, val)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((label, val))
+        return out
+
+    kv_pairs = dedup(kv_pairs)
+    bare_names = [p for p in dedup(bare_names) if p not in kv_pairs]
+    return kv_pairs, bare_names
+
+
+def resolve_service(portal, query_string, cfg, log):
+    """决定登录时要带的 service 值。
+
+    config 里 service 明确写了就用它；写 "auto" 或留空则现场发现。
+    返回 (首选值或 None, 说明, 按优先级排序的全部候选)。
+    候选列表要带出来，因为万一首选不对还能逐个重试。
+    """
+    want = cfg.get("service", "")
+    if want and str(want).lower() != "auto":
+        return want, "来自 config.json", [(want, want)]
+
+    try:
+        page_text, assets, _ = fetch_login_assets(portal, query_string)
+        kv_pairs, bare_names = discover_services(page_text, assets)
+    except Exception as e:
+        return None, "出口发现失败：%s" % e, []
+
+    keywords = [k for k in [cfg.get("service_keyword") or "移动", "移动", "学生移动", "学生"] if k]
+
+    scored = []
+    for tier, group in ((0, kv_pairs), (1, bare_names)):
+        for label, val in group:
+            rank = len(keywords) + 1
+            for i, kw in enumerate(keywords):
+                if kw in (label or "") or kw in (val or ""):
+                    rank = i
+                    break
+            scored.append((rank, tier, label, val))
+    scored.sort(key=lambda x: (x[0], x[1]))
+
+    cands = [(label, val) for _, _, label, val in scored]
+    if not cands:
+        return None, "页面和 JS 里没找到任何出口候选", []
+
+    if log:
+        log("发现 %d 个出口候选（按关键字优先级排序）：" % len(cands))
+        for label, val in cands[:25]:
+            log("    %-22s -> %s" % (label or "(无标签)", val))
+
+    rank, tier, label, val = scored[0]
+    if rank > len(keywords):
+        if len(cands) == 1:
+            return val, "唯一候选「%s」" % (label or val), cands
+        return None, ("有 %d 个候选但没一个命中关键字，"
+                      "请在 config.json 里把 service 写死" % len(cands)), cands
+    return val, "关键字命中「%s」" % (label or val), cands
 
 
 # ---------------------------------------------------------------------------
@@ -984,6 +1148,19 @@ def do_login(cfg, log, check_only=False, train_mode=False):
     else:
         log("queryString = %s" % query_string)
 
+    # --- 决定服务出口（service）---
+    # CTBU 门户要先选「学生移动出口」才能登录，这一步以前要手点，现在自动发现。
+    service_value, service_why, service_cands = resolve_service(portal, query_string, cfg, log)
+    if service_value:
+        cfg["service"] = service_value
+        log("使用出口 service = %s（%s）" % (service_value, service_why), "OK")
+    else:
+        # 关键：失败时必须清空，否则会把字面量 "auto" 当成 service 发出去
+        cfg["service"] = ""
+        log("没能确定出口 service：%s" % service_why, "WARN")
+        log("将先按空 service 尝试；若失败，请在 config.json 里把 service 写死。", "WARN")
+    svc_idx = 0
+
     templates = load_templates(log)
     missing = [d for d in "0123456789" if d not in templates]
     if missing:
@@ -1054,6 +1231,19 @@ def do_login(cfg, log, check_only=False, train_mode=False):
         if kind == "already":
             log("服务器提示已在线，视为成功。", "OK")
             return 0
+        if kind == "service":
+            # 出口没选对：换下一个候选，不消耗验证码次数
+            svc_idx += 1
+            if svc_idx < len(service_cands):
+                label, val = service_cands[svc_idx]
+                cfg["service"] = val
+                log("服务器说出口不对（%s），换成候选 #%d：%s -> %s"
+                    % (msg, svc_idx + 1, label or "(无标签)", val), "WARN")
+                continue
+            log("服务器拒绝：%s" % msg, "ERR")
+            log("已把 %d 个出口候选都试过。请在校园网里跑一次 --probe，"
+                "把报告里的「出口自动解析结果」发我。" % max(len(service_cands), 1), "ERR")
+            return 4
         if kind in ("password", "username"):
             pwd_tries += 1
             if pwd_tries < max_pwd and pwd_tries < len(strategies):
@@ -1331,6 +1521,29 @@ def do_probe(cfg, log, probe_login=False):
         add("疑似出口列表接口：")
         for u in sorted(urls)[:15]:
             add("  %s" % u)
+
+    # 用与登录时相同的逻辑解析一遍出口，确保报告里给出最终会用的那个值
+    add("")
+    add("--- 出口自动解析结果（登录时会用这个）---")
+    try:
+        assets_map = {}
+        for n in saved:
+            try:
+                assets_map[n] = smart_decode(open(os.path.join(HERE, n), "rb").read())
+            except Exception:
+                pass
+        kv_pairs, bare_names = discover_services(text, assets_map)
+        add("带 service 值的候选（%d 个）：" % len(kv_pairs))
+        for label, val in kv_pairs[:30]:
+            add("  %-24s -> %s" % (label or "(无标签)", val))
+        add("只有中文名的兜底候选（%d 个）：" % len(bare_names))
+        for label, val in bare_names[:15]:
+            add("  %s" % label)
+        chosen, why, cand_list = resolve_service(portal, qs, cfg, log=None)
+        add("最终选择：%s（%s）" % (chosen if chosen else "(没挑出来)", why))
+        add("重试顺序：%s" % (" -> ".join(v for _, v in cand_list[:8]) or "(无)"))
+    except Exception as e:
+        add("出口解析失败：%s" % e)
 
     # 顺手存一份去标签后的纯文本，方便直接阅读
     try:
